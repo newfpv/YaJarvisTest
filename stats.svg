@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="218" viewBox="0 0 820 218" role="img" aria-label="Колонок с Джарвисом: 0">
+<style>
+  .bg{fill:#ffffff;stroke:#d0d7de} .h{fill:#1f2328} .d{fill:#59636e} .l{fill:#1f2328;font-size:14px} .n{fill:#1f2328;font-size:14px;font-weight:700}
+  .track{fill:#eaeef2} .fill{fill:#8c959f} .acc{fill:#f77b2c} .ring{fill:none;stroke:#f77b2c}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Manrope,Roboto,Helvetica,Arial,sans-serif}
+  @media (prefers-color-scheme: dark){ .bg{fill:#16161c;stroke:#2c2c36} .h,.l,.n{fill:#efedf4} .d{fill:#9b97a8} .track{fill:#25252e} .fill{fill:#5d5a6b} }
+</style>
+<rect x="0.5" y="0.5" width="819" height="217" rx="20" class="bg"/>
+<circle cx="49" cy="59" r="14" stroke-width="5" class="ring"/>
+<text x="78" y="72" class="h" font-size="40" font-weight="800">0</text>
+<text x="114" y="55" class="h" font-size="16" font-weight="700">колонок с Джарвисом</text>
+<text x="114" y="75" class="d" font-size="14">на последней v0.10.8 — 0 · установщик скачали 4 раз</text>
+<text x="32" y="122" class="d" font-size="13" font-weight="700" letter-spacing=".4">МОДЕЛИ</text>
+<text x="426" y="122" class="d" font-size="13" font-weight="700" letter-spacing=".4">ВЕРСИИ</text>
+<text x="32" y="160" class="l">Пока никто не отметился — первые колонки появятся после обновления.</text>
+<text x="426" y="150" class="l">v0.10.0</text>
+  <rect x="426" y="158" width="292" height="6" rx="3" class="track"/>
+  <rect x="426" y="158" width="292" height="6" rx="3" class="fill"/>
+  <text x="788" y="164" class="n" text-anchor="end">1</text>
+<text x="32" y="200" class="d" font-size="12">Колонка отмечается сама (только модель и версия) · обновлено 21 ноября в 10:10 МСК</text>
+</svg>
