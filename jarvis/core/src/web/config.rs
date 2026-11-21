@@ -1,6 +1,6 @@
 //! Общие настройки панели. Учётные записи и протоколы подключений остаются у модулей.
 use super::{App, bad, ok, reply};
-use crate::settings::{Profile, Prompt, Settings};
+use crate::settings::{MAX_TRAIN_LIMIT_MB, Profile, Prompt, Settings};
 use axum::{
     Json,
     extract::{Query, State},
@@ -125,7 +125,7 @@ fn patch_settings(s: &mut Settings, v: &Value) -> Result<(), std::io::Error> {
     next.mic_gain_db = next.mic_gain_db.clamp(0, 30);
     next.follow_up_s = next.follow_up_s.clamp(0.0, 30.0);
     next.volume = next.volume.clamp(0, 100);
-    next.train_limit_mb = next.train_limit_mb.clamp(1, 20);
+    next.train_limit_mb = next.train_limit_mb.clamp(1, MAX_TRAIN_LIMIT_MB);
     next.city = next.city.trim().into();
     next.speaker_room = next.speaker_room.trim().into();
     for time in [&next.night.from, &next.night.to] {
@@ -345,6 +345,7 @@ mod tests {
         s.timezone = "Europe/Minsk".into();
         s.home_via = "alice".into();
         s.password_hash = "secret".into();
+        s.train_limit_mb = 50;
         s.vpn.insert("chatgpt".into(), true);
         patch_settings(
             &mut s,
@@ -353,6 +354,7 @@ mod tests {
         .unwrap();
         assert_eq!(s.password_hash, "secret");
         assert_eq!(s.volume, 100);
+        assert_eq!(s.train_limit_mb, 50);
         assert!(s.radio_off);
         assert!(!s.wake_reply_enabled);
         assert!(s.wake_enabled);

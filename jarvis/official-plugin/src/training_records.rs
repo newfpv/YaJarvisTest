@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     hash::{DefaultHasher, Hash, Hasher},
-    io::{Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -20,8 +20,7 @@ use std::{
 
 const RATE: usize = 16_000;
 const MAX_CLIP: u64 = 6 << 20;
-const MAX_ARCHIVE: u64 = 32 << 20;
-pub const MAX_LIMIT_MB: i64 = 5;
+pub const MAX_LIMIT_MB: i64 = 50;
 const KINDS: [&str; 4] = ["pos", "false", "near", "bg"];
 const CLIPS: &str = "rust-clips";
 const OLD_CLIPS: &str = "clips";
@@ -421,13 +420,11 @@ impl Records {
         Ok(json!({"changed":changed,"saved_bytes":saved}))
     }
 
-    pub fn archive(&self, data_dir: &Path, sensitivity: i64) -> Result<Vec<u8>, String> {
+    pub fn archive(&self, data_dir: &Path, sensitivity: i64, output: impl Write) -> Result<(), String> {
         let _lock = self.files.lock().unwrap();
         let clips = self.list();
-        if clips.iter().map(|c| c.size).sum::<u64>() > MAX_ARCHIVE {
-            return Err("Архив больше 32 МБ. Скачайте записи по одной".into());
-        }
-        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let mut zip = zip::ZipWriter::new(ArchiveWriter::new(output));
+        zip.set_flush_on_finish_file(true);
         let options = archive_options();
         let mut add = |name: &str, data: &[u8]| -> zip::result::ZipResult<()> {
             zip.start_file(name, options)?;
@@ -447,18 +444,68 @@ impl Records {
             include_bytes!("../../modules/wake-train/assets/finetune.py"),
         )
         .map_err(|e| e.to_string())?;
-        let mut total = 0;
         for clip in clips {
             let data = read_clip(&self.path(clip.storage, &clip.kind, &clip.name)?)?;
-            total += data.len() as u64;
-            if total > MAX_ARCHIVE {
-                return Err("Архив больше 32 МБ. Скачайте записи по одной".into());
-            }
             add(&format!("{}/{}", clip.kind, clip.name), &data).map_err(|e| e.to_string())?;
         }
-        zip.finish()
-            .map(|c| c.into_inner())
-            .map_err(|e| e.to_string())
+        let mut writer = zip.finish().map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())
+    }
+}
+
+// ZipWriter patches the current entry's header before flushing it. Keep just
+// that entry (or the final directory) seekable while sending completed bytes.
+struct ArchiveWriter<W> {
+    output: W,
+    pending: Cursor<Vec<u8>>,
+    sent: u64,
+}
+
+impl<W> ArchiveWriter<W> {
+    fn new(output: W) -> Self {
+        Self {
+            output,
+            pending: Cursor::new(Vec::new()),
+            sent: 0,
+        }
+    }
+}
+
+impl<W> Read for ArchiveWriter<W> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.pending.read(bytes)
+    }
+}
+
+impl<W: Write> Write for ArchiveWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.pending.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.write_all(self.pending.get_ref())?;
+        self.sent += self.pending.get_ref().len() as u64;
+        self.pending.get_mut().clear();
+        self.pending.set_position(0);
+        self.output.flush()
+    }
+}
+
+impl<W> Seek for ArchiveWriter<W> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let position = match position {
+            SeekFrom::Start(offset) => {
+                SeekFrom::Start(offset.checked_sub(self.sent).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "cannot seek into a completed ZIP entry")
+                })?)
+            }
+            relative => relative,
+        };
+        self.pending.seek(position).map(|offset| self.sent + offset)
+    }
+
+    fn stream_position(&mut self) -> io::Result<u64> {
+        Ok(self.sent + self.pending.position())
     }
 }
 
@@ -578,6 +625,24 @@ mod tests {
     }
 
     #[test]
+    fn keeps_collecting_when_the_archive_is_above_five_megabytes() {
+        let root = std::env::temp_dir().join(format!("jarvis-training-limit-{}", rand_hex(5)));
+        let records = Records::new(root.clone());
+        let reviewed = root.join(CLIPS).join("pos").join("large_r.wav");
+        fs::create_dir_all(reviewed.parent().unwrap()).unwrap();
+        fs::File::create(&reviewed).unwrap().set_len(5 << 20).unwrap();
+
+        records.save("near", &[241; 16_000], 0.49, 50, false).unwrap();
+
+        let snapshot = records.snapshot(true, 50, false);
+        assert_eq!(snapshot["limit_mb"], 50);
+        assert_eq!(snapshot["local"], 2);
+        assert!(reviewed.is_file());
+        assert_eq!(records.snapshot(true, 51, false)["limit_mb"], 50);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn exports_existing_and_new_recordings_with_labels_and_model() {
         let root = std::env::temp_dir().join(format!("jarvis-dataset-{}", rand_hex(5)));
         let records = Records::new(root.clone());
@@ -595,7 +660,8 @@ mod tests {
         assert!(reviewed.reviewed);
         assert_eq!(&records.read("pos", &reviewed.name).unwrap()[..4], b"RIFF");
         fs::write(root.join("wake.bin"), b"model").unwrap();
-        let data = records.archive(&root, 8).unwrap();
+        let mut data = Vec::new();
+        records.archive(&root, 8, &mut data).unwrap();
         let mut zip = zip::ZipArchive::new(Cursor::new(data)).unwrap();
         assert!(zip.by_name("finetune.py").is_ok());
         assert!(zip.by_name("near/legacy.wav").is_ok());
@@ -606,6 +672,57 @@ mod tests {
         assert_eq!(records.compact().unwrap()["changed"], 1);
         assert_eq!(records.compact().unwrap()["changed"], 0);
         assert_eq!(records.read("near", "legacy.wav").unwrap(), raw);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exports_nearly_fifty_mib_of_recordings_as_one_zip() {
+        let root = std::env::temp_dir().join(format!("jarvis-dataset-{}", rand_hex(5)));
+        let records = Records::new(root.clone());
+        let clips = root.join(CLIPS).join("pos");
+        fs::create_dir_all(&clips).unwrap();
+        fs::write(root.join("wake.bin"), b"model").unwrap();
+
+        let mut wav = pcm_wav(&vec![0; 11 << 18]);
+        let compressed = compress(&wav).unwrap();
+        fs::write(clips.join("compressed.wav"), &compressed).unwrap();
+        getrandom::fill(&mut wav[44..]).unwrap();
+        for index in 0..9 {
+            fs::write(clips.join(format!("clip-{index}.wav")), &wav).unwrap();
+        }
+        let stored = wav.len() * 9 + compressed.len();
+        let limit = (MAX_LIMIT_MB as usize) << 20;
+        assert!(((49 << 20)..limit).contains(&stored));
+        assert!(wav.len() * 10 > limit);
+
+        let path = root.join("export.zip");
+        records
+            .archive(&root, 8, fs::File::create(&path).unwrap())
+            .unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > 32 << 20);
+        let mut zip = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(zip.len(), 13);
+        for name in ["wake.bin", "wake.json", "finetune.py"] {
+            assert!(zip.by_name(name).is_ok());
+        }
+        let mut extracted = Vec::new();
+        for index in 0..9 {
+            extracted.clear();
+            zip.by_name(&format!("pos/clip-{index}.wav"))
+                .unwrap()
+                .read_to_end(&mut extracted)
+                .unwrap();
+            assert_eq!(extracted, wav);
+        }
+        extracted.clear();
+        zip.by_name("pos/compressed.wav")
+            .unwrap()
+            .read_to_end(&mut extracted)
+            .unwrap();
+        assert_eq!(extracted.len(), wav.len());
+        assert_eq!(&extracted[..44], &wav[..44]);
+        assert!(extracted[44..].iter().all(|&byte| byte == 0));
+        drop(zip);
         fs::remove_dir_all(root).unwrap();
     }
 }

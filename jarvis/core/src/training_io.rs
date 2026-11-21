@@ -51,6 +51,37 @@ impl Drop for Transfer {
     }
 }
 
+#[cfg(unix)]
+pub struct ArchiveSocket(PathBuf);
+
+#[cfg(unix)]
+impl ArchiveSocket {
+    pub fn bind() -> std::io::Result<(Self, tokio::net::UnixListener)> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let directory = std::env::temp_dir()
+            .join(format!("jarvis-archive-{}", crate::settings::rand_hex(12)));
+        fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let socket = Self(directory.join("zip.sock"));
+        let listener = tokio::net::UnixListener::bind(socket.path())?;
+        Ok((socket, listener))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ArchiveSocket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path());
+        if let Some(directory) = self.path().parent() {
+            let _ = fs::remove_dir(directory);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct AudioBatch {
     pcm: Vec<i16>,

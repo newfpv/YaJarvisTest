@@ -37,22 +37,24 @@ pub fn find(name: &str) -> Option<&'static [u8]> {
 }
 
 pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
-    let mut name = uri.path().trim_start_matches('/').to_string();
-    if name.is_empty() || name.ends_with('/') {
-        name.push_str("index.html");
-    }
-    if name.split('/').any(|p| p == "..") {
+    let path = uri.path().trim_start_matches('/');
+    if path.split('/').any(|part| part == "..") {
         return super::empty(StatusCode::NOT_FOUND);
     }
-    let Some(raw) = find(&name) else { return super::empty(StatusCode::NOT_FOUND) };
-    let cache = if name.starts_with("assets/") {
+    let (name, raw) = match find(path) {
+        Some(raw) => (path, Some(raw)),
+        None if matches!(path.split('/').next(), Some("api" | "assets" | "_app")) => (path, None),
+        None => ("index.html", find("index.html")),
+    };
+    let Some(raw) = raw else { return super::empty(StatusCode::NOT_FOUND) };
+    let cache = if name.starts_with("_app/immutable/") || name.starts_with("assets/") {
         HeaderValue::from_static("public, max-age=31536000, immutable")
     } else {
         HeaderValue::from_static("no-cache")
     };
     let compressed = raw.starts_with(&[0x1f, 0x8b]);
     let mut b = Response::builder()
-        .header(header::CONTENT_TYPE, mime(&name))
+        .header(header::CONTENT_TYPE, mime(name))
         .header(header::CACHE_CONTROL, cache);
     if compressed {
         b = b.header(header::VARY, "Accept-Encoding");

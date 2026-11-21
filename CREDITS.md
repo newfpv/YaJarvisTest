@@ -6,7 +6,7 @@ YaJavis появился благодаря открытым проектам и
 
 | Автор | Проект | Что использовано |
 | :--- | :--- | :--- |
-| **dimap** | [yapanel](https://github.com/dimap/yapanel-web) | Визуальный ориентир веб-панели: тёмная тема, оранжевый акцент, карточки состояния, графики и музыкальный интерфейс. Атрибуция также сохранена в заголовке `jarvisd/ui/app.css`. |
+| **dimap** | [yapanel](https://github.com/dimap/yapanel-web) | Визуальный ориентир веб-панели: тёмная тема, оранжевый акцент, карточки состояния, графики и музыкальный интерфейс. Атрибуция также сохранена в заголовке `jarvisd/ui/src/app.css`. |
 | **Marker284 и участники сообщества** | [Yandex Station Extended](https://github.com/Marker284/yandex-station-extended), [hackalice.me](https://hackalice.me/) | Исследования root-доступа, устройства прошивок, аудиотракта, подсветки и аппаратных различий Станций. |
 | **rison1337** | [Alisa ChatGPT Voice Assistant](https://github.com/rison1337/Alisa-ChatGPT-voice-assistant) | Отправная точка ранних экспериментов с ChatGPT Voice на Станции и подключением аудио колонки. |
 | **amirilivice** | [quasard](https://github.com/amirilivice/quasard) | Ориентир на раннем этапе работы с собственным голосовым бэкендом Станции. Текущая программа YaJavis работает непосредственно на колонке. |

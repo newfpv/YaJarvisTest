@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#111116">
+<title>Джарвис</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='11' fill='none' stroke='%23f47a2e' stroke-width='5'/%3E%3C/svg%3E">
+%sveltekit.head%
+</head>
+<body>
+<svg class="defs" width="0" height="0" aria-hidden="true"><filter id="goo" x="-50%" y="-50%" width="200%" height="200%">
+  <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="b"/><feColorMatrix in="b" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 22 -10" result="g"/>
+  <feComposite in="SourceGraphic" in2="g" operator="atop"/></filter>
+  <linearGradient id="spark-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f47a2e" stop-opacity=".32"/><stop offset="1" stop-color="#f47a2e" stop-opacity="0"/></linearGradient></svg>
+<div id="panel">%sveltekit.body%</div>
+</body>
+</html>

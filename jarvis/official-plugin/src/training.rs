@@ -134,9 +134,23 @@ impl Training {
                 Ok(Value::Null)
             }
             "training.archive" => {
-                let archive =
-                    records.archive(&core, params["sensitivity"].as_i64().unwrap_or(0))?;
-                fs::write(spool()?, archive).map_err(|error| error.to_string())?;
+                let sensitivity = params["sensitivity"].as_i64().unwrap_or(0);
+                #[cfg(unix)]
+                if let Some(path) = params["socket"].as_str() {
+                    let stream = std::os::unix::net::UnixStream::connect(path)
+                        .map_err(|error| error.to_string())?;
+                    stream
+                        .set_write_timeout(Some(std::time::Duration::from_secs(35)))
+                        .map_err(|error| error.to_string())?;
+                    records.archive(&core, sensitivity, stream)?;
+                    return Ok(Value::Null);
+                }
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(spool()?)
+                    .map_err(|error| error.to_string())?;
+                records.archive(&core, sensitivity, file)?;
                 Ok(Value::Null)
             }
             "training.train" => {

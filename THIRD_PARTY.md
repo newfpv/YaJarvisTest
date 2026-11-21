@@ -1,6 +1,6 @@
 # Third-party components
 
-The panel's visual design was inspired by **dimap's [yapanel](https://github.com/dimap/yapanel-web)** (MIT, copyright 2026 dimap). The attribution remains in `jarvisd/ui/app.css`; its license is preserved in `LICENSES/yapanel-LICENSE`. See [CREDITS.md](CREDITS.md) for the authors and technical references used throughout the project.
+The panel's visual design was inspired by **dimap's [yapanel](https://github.com/dimap/yapanel-web)** (MIT, copyright 2026 dimap). The attribution remains in `jarvisd/ui/src/app.css`; its license is preserved in `LICENSES/yapanel-LICENSE`. See [CREDITS.md](CREDITS.md) for the authors and technical references used throughout the project.
 
 - Lucide icons — ISC, https://github.com/lucide-icons/lucide; license preserved in `LICENSES/Lucide-LICENSE`.
 
