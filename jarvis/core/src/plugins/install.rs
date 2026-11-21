@@ -128,7 +128,7 @@ fn unpack_plan_to_dir<R: Read + std::io::Seek>(
     plan: &ArchPlan,
     dir: &Path,
 ) -> Result<(), String> {
-    let mut buf = [0u8; 32 * 1024];
+    let mut buf = vec![0u8; 32 * 1024];
     let mut total = 0usize;
     let mut elf_head = [0u8; 20];
     let mut elf_len = 0usize;

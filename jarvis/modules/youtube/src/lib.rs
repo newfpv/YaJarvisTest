@@ -469,7 +469,7 @@ impl Youtube {
                         first
                     };
                     if first {
-                        service.wake.notify_one();
+                        self.wake.notify_one();
                         if needs_related {
                             let service = self.clone();
                             let seed = track.id.clone();

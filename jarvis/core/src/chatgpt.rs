@@ -332,7 +332,7 @@ pub async fn warm_loop(host: Arc<Host>, store: crate::settings::Store) {
     tokio::time::sleep(Duration::from_secs(15)).await; // плагины ещё запускаются
     loop {
         if !store.is_night()
-            && store.with(|s| s.active_profile_ref().engine == "chatgpt" && signed_in(&s.chatgpt))
+            && store.with(|s| s.active_profile_ref().is_some_and(|p| p.engine == "chatgpt") && signed_in(&s.chatgpt))
             && let Ok(n) = host.provider("chatgpt")
         {
             let _ = n.request("voice.warm", Value::Null, Duration::from_secs(5)).await;
