@@ -110,7 +110,7 @@ async fn security_checks() -> Value {
     let listening = |port: u16| async move {
         tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            tokio::net::TcpStream::connect(([127, 0, 0, 1], port)),
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
         )
         .await
         .is_ok_and(|r| r.is_ok())

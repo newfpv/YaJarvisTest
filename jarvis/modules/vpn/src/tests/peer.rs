@@ -195,8 +195,9 @@ async fn vision_carries_inner_tls13_with_independent_xray() {
         let vpn=Vpn::new();let state=vpn.request(json!({"link":format!("vless://{UUID}@127.0.0.1:{port}?security=reality&pbk={key}&sid=0123456789abcdef&sni=vpn.example.org&flow=xtls-rprx-vision-udp443")})).await.unwrap();
         let socket=socks(&state,"127.0.0.1",target_port).await;
         let inner_config=Config::parse(&format!("vless://{UUID}@127.0.0.1:443?security=tls&sni=vpn.example.org&allowInsecure=1")).unwrap();
-        let connector=tokio_rustls::TlsConnector::from(transport::tls_config(&inner_config).unwrap());
-        let mut socket=connector.connect("vpn.example.org".try_into().unwrap(),socket).await.unwrap();
+        let conn=reality_tls::ClientConnection::new(transport::tls_config(&inner_config).unwrap(),"vpn.example.org".try_into().unwrap()).unwrap();
+        let mut socket=crate::tls_io::TlsIo::new(Box::new(socket),conn);
+        socket.handshake().await.unwrap();
         let payload:Vec<u8>=(0..262144).map(|i|(i%251) as u8).collect();
         let (mut r,mut w)=tokio::io::split(&mut socket);
         let send=async{w.write_all(&payload).await.unwrap();w.flush().await.unwrap();};

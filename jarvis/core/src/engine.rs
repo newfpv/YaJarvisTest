@@ -600,7 +600,7 @@ impl Engine {
                 }
                 let mut guard = ConverseGuard { engine: &e, completed: false };
                 let preroll = if by_word { clip.clone() } else { vec![] };
-                guard.engine.converse(by_word, sure, preroll, clip);
+                e.converse(by_word, sure, preroll, clip);
                 guard.completed = true;
                 let queued = {
                     let mut st = e.st.lock().unwrap();
