@@ -37,12 +37,14 @@ struct St {
     link: String,
     tun: Option<Tunnel>,
     err: String,
+    cleared: bool,
 }
 
 pub struct Proxy {
     st: RwLock<St>,
     store: Store,
     refresh_lock: tokio::sync::Mutex<()>,
+    notify: tokio::sync::Notify,
 }
 
 /// Куда ходить подключению: напрямую, через туннель или никуда (с причиной).
@@ -58,6 +60,7 @@ impl Proxy {
             st: RwLock::default(),
             store,
             refresh_lock: tokio::sync::Mutex::new(()),
+            notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -120,35 +123,45 @@ impl Proxy {
                 Ok(())
             })
             .map_err(|e| e.to_string())?;
+        if link.is_empty() {
+            self.st.write().unwrap().cleared = false;
+        }
         self.refresh_inner(host).await;
+        self.notify.notify_one();
         Ok(())
     }
 
     async fn refresh_inner(&self, host: &Host) {
         let link = self.store.with(|s| s.vless.trim().to_string());
-        let (tun, err) = if link.is_empty() {
+        if link.is_empty()
+            && self.st.read().unwrap().cleared
+        {
+            return;
+        }
+        let (tun, err, cleared) = if link.is_empty() {
             // Clearing the link also closes the module's listener and active streams.
             if let Ok(provider) = vpn_provider(host) {
                 let _ = provider
                     .request("vpn", json!({"link":""}), Duration::from_secs(5))
                     .await;
             }
-            (None, String::new())
+            (None, String::new(), true)
         } else {
             match vpn_provider(host) {
-                Err(why) => (None, why),
+                Err(why) => (None, why, false),
                 Ok(n) => match n
                     .request("vpn", json!({"link": link}), Duration::from_secs(5))
                     .await
                 {
                     Ok(v) => match serde_json::from_value::<Tunnel>(v) {
-                        Ok(t) if t.valid() => (Some(t), String::new()),
+                        Ok(t) if t.valid() => (Some(t), String::new(), false),
                         _ => (
                             None,
                             "плагин VPN вернул неправильный локальный SOCKS".into(),
+                            false,
                         ),
                     },
-                    Err(e) => (None, e),
+                    Err(e) => (None, e, false),
                 },
             }
         };
@@ -156,12 +169,26 @@ impl Proxy {
         st.link = link;
         st.tun = tun;
         st.err = err;
+        st.cleared = cleared;
     }
 
     pub async fn run(self: Arc<Self>, host: Arc<Host>) {
         loop {
             self.refresh(&host).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            let delay = {
+                let st = self.st.read().unwrap();
+                if st.link.is_empty() {
+                    Duration::from_secs(60)
+                } else if st.tun.is_some() {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_secs(3)
+                }
+            };
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = tokio::time::sleep(delay) => {}
+            }
         }
     }
 }

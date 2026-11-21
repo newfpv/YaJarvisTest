@@ -145,18 +145,29 @@ impl Prepared {
 pub struct Scripts(tokio::sync::Mutex<ScriptCache>);
 #[derive(Default)]
 struct ScriptCache {
-    current: Option<(Instant, String, Arc<Prepared>)>,
+    current: Option<(Instant, Instant, String, Arc<Prepared>)>,
     failed: Option<(Instant, String)>,
 }
 impl Scripts {
     pub fn cached(&self) -> bool {
         self.0.try_lock().is_ok_and(|cache| cache.current.is_some())
     }
+    pub async fn evict_if_idle(&self, idle: Duration) {
+        let mut state = self.0.lock().await;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|(_, used, _, _)| used.elapsed() >= idle)
+        {
+            state.current.take();
+        }
+    }
     pub async fn get(&self, client: &Client) -> Result<Arc<Prepared>, String> {
         let mut state = self.0.lock().await;
-        if let Some((at, _, prepared)) = state.current.as_ref()
+        if let Some((at, used, _, prepared)) = state.current.as_mut()
             && at.elapsed() < Duration::from_secs(1800)
         {
+            *used = Instant::now();
             return Ok(prepared.clone());
         }
         if let Some((at, error)) = &state.failed
@@ -170,10 +181,12 @@ impl Scripts {
             .captures(&iframe)
             .map(|capture| capture[1].to_owned())
             .ok_or("Не найдена версия плеера YouTube")?;
-        if let Some((at, old, prepared)) = state.current.as_mut()
+        if let Some((at, used, old, prepared)) = state.current.as_mut()
             && *old == id
         {
-            *at = Instant::now();
+            let now = Instant::now();
+            *at = now;
+            *used = now;
             return Ok(prepared.clone());
         }
         state.current.take();
@@ -207,7 +220,8 @@ impl Scripts {
             "YouTube: плеер {id} готов за {:.2} с",
             started.elapsed().as_secs_f64()
         );
-        state.current = Some((Instant::now(), id, prepared.clone()));
+        let now = Instant::now();
+        state.current = Some((now, now, id, prepared.clone()));
         state.failed = None;
         Ok(prepared)
     }

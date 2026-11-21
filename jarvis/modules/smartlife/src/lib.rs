@@ -74,6 +74,7 @@ pub struct SmartLife {
     catalog: tokio::sync::Mutex<()>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    auth_notify: Arc<tokio::sync::Notify>,
 }
 
 impl SmartLife {
@@ -88,32 +89,52 @@ impl SmartLife {
             catalog: Default::default(),
             tasks: Default::default(),
             poller: Default::default(),
+            auth_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     pub fn start_lan(&self) {
-        let mut tasks = self.tasks.lock().unwrap();
-        for port in [6666, 6667, 7000] {
-            let lan = self.lan.clone();
-            let host = self.host.clone();
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    let signed_in = host.config().await.is_ok_and(|c| {
-                        c["auth"]["refresh_token"]
-                            .as_str()
-                            .is_some_and(|s| !s.is_empty())
-                    });
-                    if signed_in {
-                        tokio::select! {
-                            _=lan.listen(port)=>{},
-                            _=tokio::time::sleep(Duration::from_secs(30))=>{},
-                        }
-                    } else {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+        struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                for task in self.0.drain(..) {
+                    task.abort();
+                }
+            }
+        }
+
+        let lan = self.lan.clone();
+        let host = self.host.clone();
+        let notify = self.auth_notify.clone();
+        self.tasks.lock().unwrap().push(tokio::spawn(async move {
+            let mut children = AbortOnDrop(Vec::new());
+            loop {
+                let signed_in = host.config().await.is_ok_and(|c| {
+                    c["auth"]["refresh_token"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                });
+                if signed_in && children.0.is_empty() {
+                    for port in [6666, 6667, 7000] {
+                        let lan = lan.clone();
+                        children.0.push(tokio::spawn(async move {
+                            loop {
+                                lan.listen(port).await;
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                            }
+                        }));
+                    }
+                } else if !signed_in && !children.0.is_empty() {
+                    for task in children.0.drain(..) {
+                        task.abort();
                     }
                 }
-            }));
-        }
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                }
+            }
+        }));
     }
 
     pub fn stop(&self) {
@@ -269,6 +290,7 @@ impl SmartLife {
                 ..Default::default()
             };
             if success {
+                this.auth_notify.notify_one();
                 let _ = this.refresh_devices().await;
             }
         });
@@ -297,6 +319,7 @@ impl SmartLife {
         let _refresh = self.refresh.lock().await;
         let old = self.config().await?;
         self.update_auth(&old, &Auth::default(), false).await?;
+        self.auth_notify.notify_one();
         *self.login.lock().unwrap() = Login::default();
         self.clear_catalog()
     }

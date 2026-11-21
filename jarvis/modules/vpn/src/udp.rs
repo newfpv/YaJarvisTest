@@ -85,7 +85,7 @@ pub(crate) async fn associate(
     mut control: TcpStream,
     source: Target,
     config: Arc<Config>,
-    tls: Arc<rustls::ClientConfig>,
+    tls: Arc<reality_tls::ClientConfig>,
     limit: Arc<Semaphore>,
 ) -> io::Result<()> {
     let peer = control.peer_addr()?;
@@ -168,7 +168,7 @@ async fn xudp_read_meta(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<(u8
 
 async fn forward(
     config: Arc<Config>,
-    tls: Arc<rustls::ClientConfig>,
+    tls: Arc<reality_tls::ClientConfig>,
     target: Target,
     relay: Arc<UdpSocket>,
     client: SocketAddr,

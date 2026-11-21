@@ -9,19 +9,21 @@ const LIVE_1: &str = "gpt-live-1-codex";
 const PLAYOUT_BUFFER: Duration = Duration::from_millis(100);
 const LATE_PACKET_GRACE: Duration = Duration::from_millis(30);
 const AUDIO_PAYLOAD: u8 = 111;
-static VOICE_CATALOG: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
-    serde_json::from_str(include_str!("../../../core/src/catalog.json")).expect("voice catalog")
-});
+const CHATGPT_VOICES: &[&str] = &[
+    "cove", "juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol",
+    "aube", "rivage", "bubbie", "haetsal", "hanul", "himari", "rindo", "leher", "neer",
+    "miko", "sonna", "rio", "viola", "tinta",
+];
 pub struct RtcVoice {pub id:String,pub requested_model:&'static str,pc:Arc<dyn PeerConnection>,dc:Arc<dyn DataChannel>,pending:Arc<Mutex<Vec<i16>>>,stop:tokio::sync::watch::Sender<bool>,tasks:Mutex<Vec<tokio::task::JoinHandle<()>>>}
 struct Guard(Option<Arc<dyn PeerConnection>>);
 impl Drop for Guard{fn drop(&mut self){if let Some(pc)=self.0.take(){tokio::spawn(async move{let _=pc.close().await;});}}}
 async fn emit(services:&Callback,id:&str,kind:&str,value:Value){let _=services("voice.event".into(),json!({"id":id,"kind":kind,"value":value})).await;}
 fn selected_voice(value: &Value) -> Result<&str, String> {
     let voice = value.as_str().filter(|voice| !voice.is_empty()).unwrap_or("cove");
-    let supported = VOICE_CATALOG["chatgpt_voice_groups"].as_array().into_iter().flatten()
-        .flat_map(|group| group["voices"].as_array().into_iter().flatten())
-        .any(|entry| entry["ID"] == voice);
-    supported.then_some(voice).ok_or_else(|| "Этот голос недоступен для подписки ChatGPT".into())
+    CHATGPT_VOICES
+        .contains(&voice)
+        .then_some(voice)
+        .ok_or_else(|| "Этот голос недоступен для подписки ChatGPT".into())
 }
 
 async fn rejected_model(mut response: reqwest::Response) -> bool {

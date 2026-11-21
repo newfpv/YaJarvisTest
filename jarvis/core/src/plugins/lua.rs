@@ -328,6 +328,7 @@ impl Script {
         let runtime = tokio::runtime::Handle::current();
         std::thread::Builder::new()
             .name(format!("lua-{}", m.id))
+            .stack_size(512 * 1024)
             .spawn(move || {
                 let _exit = exit_tx; // уходит последним, после vm: тогда stop() знает, что поток закончил
                 let (vm, caps) = match Vm::open(
@@ -350,12 +351,19 @@ impl Script {
                 }
                 while !stop.load(Ordering::Relaxed) {
                     vm.tick();
+                    let next = api::next_at(&vm.timers);
                     let req = match runtime.block_on(async {
-                        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+                        match next {
+                            Some(at) => {
+                                let wait = at.saturating_duration_since(Instant::now());
+                                tokio::time::timeout(wait, rx.recv()).await.ok()
+                            }
+                            None => Some(rx.recv().await),
+                        }
                     }) {
-                        Ok(Some(req)) => req,
-                        Ok(None) => break,
-                        Err(_) => continue,
+                        Some(Some(req)) => req,
+                        Some(None) => break,
+                        None => continue,
                     };
                     match req {
                         Request::Stop => {

@@ -62,6 +62,9 @@ impl Remote {
             .await
             .map(|_| ())
     }
+    pub async fn evict_idle(&self, idle: Duration) {
+        self.scripts.evict_if_idle(idle).await;
+    }
     pub async fn search(&self, query: &str, headers: HeaderMap) -> Result<Vec<Track>, String> {
         let mut body = json!({"context":{"client":web()},"query":query});
         let client = self.host.client().await?;

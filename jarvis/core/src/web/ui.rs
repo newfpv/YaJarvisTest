@@ -45,11 +45,21 @@ pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
         return super::empty(StatusCode::NOT_FOUND);
     }
     let Some(raw) = find(&name) else { return super::empty(StatusCode::NOT_FOUND) };
+    let cache = if name.starts_with("assets/") {
+        HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("no-cache")
+    };
+    let compressed = raw.starts_with(&[0x1f, 0x8b]);
     let mut b = Response::builder()
         .header(header::CONTENT_TYPE, mime(&name))
-        .header(header::VARY, "Accept-Encoding")
-        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    let body = if accepts_gzip(&headers) {
+        .header(header::CACHE_CONTROL, cache);
+    if compressed {
+        b = b.header(header::VARY, "Accept-Encoding");
+    }
+    let body = if !compressed {
+        Body::from(raw)
+    } else if accepts_gzip(&headers) {
         b = b.header(header::CONTENT_ENCODING, "gzip");
         Body::from(raw)
     } else {

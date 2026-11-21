@@ -9,6 +9,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{SyncSender, TrySendError, sync_channel},
     },
     time::{Duration, Instant},
@@ -28,13 +29,14 @@ pub struct CmdSpotter {
     path: PathBuf,
     on_hit: OnHit,
     st: Arc<Mutex<St>>,
+    active: Arc<AtomicBool>,
 }
 
 impl CmdSpotter {
     /// None — программы spotcmd рядом нет (не та колонка или старая установка).
     pub fn new(data: &Path, on_hit: OnHit) -> Option<CmdSpotter> {
         let path = data.join("spotcmd");
-        path.exists().then(|| CmdSpotter { path, on_hit, st: Arc::default() })
+        path.exists().then(|| CmdSpotter { path, on_hit, st: Arc::default(), active: Arc::new(AtomicBool::new(false)) })
     }
 
     /// Кадр микрофона, пока Джарвис занят. Запускает распознаватель, если он ещё не работает.
@@ -53,10 +55,14 @@ impl CmdSpotter {
 
     /// Джарвис свободен: через 15 с распознаватель выключается (закрытый вход — он завершится сам).
     pub fn idle(&self) {
+        if !self.active.load(Ordering::Relaxed) {
+            return;
+        }
         let mut st = self.st.lock().unwrap();
         if st.child.is_some() && st.last_on.is_some_and(|t| t.elapsed() > Duration::from_secs(15)) {
             st.child = None;
             st.feed = None;
+            self.active.store(false, Ordering::Release);
         }
     }
 
@@ -78,18 +84,22 @@ impl CmdSpotter {
         let pid = child.id();
         st.child = Some(pid);
         st.feed = Some(tx);
+        self.active.store(true, Ordering::Release);
         let started = Instant::now();
-        std::thread::spawn(move || {
+        let _ = std::thread::Builder::new().name("spotcmd-in".into()).stack_size(128 * 1024).spawn(move || {
             let mut stdin: ChildStdin = stdin;
             for pcm in rx {
-                let buf: Vec<u8> = pcm.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let mut buf = Vec::with_capacity(pcm.len() * 2);
+                for v in pcm {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
                 if stdin.write_all(&buf).is_err() {
                     break;
                 }
             }
         });
-        let (on_hit, shared) = (self.on_hit.clone(), self.st.clone());
-        std::thread::spawn(move || {
+        let (on_hit, shared, active) = (self.on_hit.clone(), self.st.clone(), self.active.clone());
+        let _ = std::thread::Builder::new().name("spotcmd-out".into()).stack_size(128 * 1024).spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if let Some(p) = line.strip_prefix("HIT ") {
                     on_hit(p.trim().to_string());
@@ -100,6 +110,7 @@ impl CmdSpotter {
             if st.child == Some(pid) {
                 st.child = None;
                 st.feed = None;
+                active.store(false, Ordering::Release);
                 if started.elapsed() < Duration::from_secs(5) {
                     log::info!("команды: распознаватель сразу завершился ({status:?}) — попробую через минуту");
                     st.broken = Some(Instant::now());

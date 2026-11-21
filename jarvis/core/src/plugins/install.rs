@@ -50,16 +50,19 @@ fn reboot_origin(data_dir: &Path) -> Result<String, String> {
     Err("Для обновления плагина нужна перезагрузка колонки, здесь она недоступна".into())
 }
 
-/// Разобрать и проверить архив. Архив может лежать как есть или в одной папке верхнего уровня (как его делает GitHub).
-pub fn unpack(raw: &[u8]) -> Result<(BTreeMap<String, Vec<u8>>, Manifest), String> {
-    if raw.len() > ZIP_MAX {
-        return Err(format!("архив плагина больше {} МБ", ZIP_MAX >> 20));
-    }
-    let mut zr = zip::ZipArchive::new(std::io::Cursor::new(raw)).map_err(|_| "это не zip-архив плагина".to_string())?;
-    let mut files = BTreeMap::new();
-    let mut total = 0usize;
+struct ArchPlan {
+    prefix: String,
+    entries: Vec<(usize, String)>,
+    manifest: Manifest,
+    total_hint: u64,
+}
+
+fn inspect_archive<R: Read + std::io::Seek>(zr: &mut zip::ZipArchive<R>) -> Result<ArchPlan, String> {
+    let mut raw_names: Vec<(usize, String, u64)> = Vec::new();
+    let mut root_manifest: Option<usize> = None;
+    let mut nested_manifests: Vec<(usize, String)> = Vec::new();
     for i in 0..zr.len() {
-        let mut f = zr.by_index(i).map_err(|e| e.to_string())?;
+        let f = zr.by_index(i).map_err(|e| e.to_string())?;
         let name = f.name().replace('\\', "/");
         let base = name.rsplit('/').next().unwrap_or("");
         if f.is_dir() || base.starts_with("__MACOSX") || name.contains("/__MACOSX/") || name.starts_with("__MACOSX/") {
@@ -74,32 +77,122 @@ pub fn unpack(raw: &[u8]) -> Result<(BTreeMap<String, Vec<u8>>, Manifest), Strin
         if !clean_ok {
             return Err(format!("в архиве недопустимый путь: {name}"));
         }
+        if name == "plugin.json" {
+            root_manifest = Some(i);
+        } else if name.ends_with("/plugin.json") && name.matches('/').count() == 1 {
+            nested_manifests.push((i, name.trim_end_matches("plugin.json").to_string()));
+        }
+        raw_names.push((i, name, f.size()));
+    }
+    let (manifest_idx, prefix) = if let Some(idx) = root_manifest {
+        (idx, String::new())
+    } else if let Some((idx, pfx)) = nested_manifests.into_iter().next() {
+        (idx, pfx)
+    } else {
+        return Err("в архиве нет plugin.json".into());
+    };
+    let mut mf = zr.by_index(manifest_idx).map_err(|e| e.to_string())?;
+    let mut mf_bytes = Vec::new();
+    mf.by_ref()
+        .take((256 * 1024 + 1) as u64)
+        .read_to_end(&mut mf_bytes)
+        .map_err(|e| e.to_string())?;
+    if mf_bytes.len() > 256 * 1024 {
+        return Err("plugin.json слишком большой".into());
+    }
+    drop(mf);
+    let m: Manifest = serde_json::from_slice(&mf_bytes).map_err(|e| format!("plugin.json: {e}"))?;
+    m.validate()?;
+    let mut entries = Vec::new();
+    let mut total_hint = 0u64;
+    let mut has_main = false;
+    for (idx, name, sz) in raw_names {
+        let Some(rel) = name.strip_prefix(&prefix) else { continue };
+        if rel.is_empty() {
+            continue;
+        }
+        if rel == m.main {
+            has_main = true;
+        }
+        total_hint = total_hint.saturating_add(sz);
+        entries.push((idx, rel.to_string()));
+    }
+    if matches!(m.kind.as_str(), "lua" | "rust") && !has_main {
+        return Err(format!("в архиве нет {}", m.main));
+    }
+    Ok(ArchPlan { prefix, entries, manifest: m, total_hint })
+}
+
+fn unpack_plan_to_dir<R: Read + std::io::Seek>(
+    zr: &mut zip::ZipArchive<R>,
+    plan: &ArchPlan,
+    dir: &Path,
+) -> Result<(), String> {
+    let mut buf = [0u8; 32 * 1024];
+    let mut total = 0usize;
+    let mut elf_head = [0u8; 20];
+    let mut elf_len = 0usize;
+    for (idx, rel) in &plan.entries {
+        let mut f = zr.by_index(*idx).map_err(|e| e.to_string())?;
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+        let mut opt = std::fs::OpenOptions::new();
+        opt.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mode = if plan.manifest.kind == "rust" && rel == &plan.manifest.main { 0o700 } else { 0o644 };
+            opt.mode(mode);
+        }
+        let mut out = opt.open(&p).map_err(|e| e.to_string())?;
+        let is_main = plan.manifest.kind == "rust" && rel == &plan.manifest.main;
+        loop {
+            let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            total = total.checked_add(n).ok_or_else(|| format!("плагин больше {} МБ в распакованном виде", UNPACK_MAX >> 20))?;
+            if total > UNPACK_MAX {
+                return Err(format!("плагин больше {} МБ в распакованном виде", UNPACK_MAX >> 20));
+            }
+            if is_main && elf_len < 20 {
+                let take = (20 - elf_len).min(n);
+                elf_head[elf_len..elf_len + take].copy_from_slice(&buf[..take]);
+                elf_len += take;
+            }
+            out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        }
+    }
+    if plan.manifest.kind == "rust" {
+        super::process::check_binary(&elf_head[..elf_len], &plan.manifest.arch)?;
+    }
+    Ok(())
+}
+
+/// Разобрать и проверить архив. Архив может лежать как есть или в одной папке верхнего уровня (как его делает GitHub).
+pub fn unpack(raw: &[u8]) -> Result<(BTreeMap<String, Vec<u8>>, Manifest), String> {
+    if raw.len() > ZIP_MAX {
+        return Err(format!("архив плагина больше {} МБ", ZIP_MAX >> 20));
+    }
+    let mut zr = zip::ZipArchive::new(std::io::Cursor::new(raw)).map_err(|_| "это не zip-архив плагина".to_string())?;
+    let plan = inspect_archive(&mut zr)?;
+    let _ = &plan.prefix;
+    let mut files = BTreeMap::new();
+    let mut total = 0usize;
+    for (idx, rel) in &plan.entries {
+        let mut f = zr.by_index(*idx).map_err(|e| e.to_string())?;
         let mut b = Vec::new();
         f.by_ref().take((UNPACK_MAX - total + 1) as u64).read_to_end(&mut b).map_err(|e| e.to_string())?;
         total += b.len();
         if total > UNPACK_MAX {
             return Err(format!("плагин больше {} МБ в распакованном виде", UNPACK_MAX >> 20));
         }
-        files.insert(name, b);
+        files.insert(rel.clone(), b);
     }
-    if !files.contains_key("plugin.json") {
-        // всё в одной папке верхнего уровня — снимаем её
-        let prefix = files
-            .keys()
-            .find(|n| n.ends_with("/plugin.json") && n.matches('/').count() == 1)
-            .map(|n| n.trim_end_matches("plugin.json").to_string())
-            .ok_or("в архиве нет plugin.json")?;
-        files = files.into_iter().filter_map(|(n, b)| n.strip_prefix(&prefix).map(|r| (r.to_string(), b))).collect();
+    if plan.manifest.kind == "rust" {
+        super::process::check_binary(&files[&plan.manifest.main], &plan.manifest.arch)?;
     }
-    let m: Manifest = serde_json::from_slice(&files["plugin.json"]).map_err(|e| format!("plugin.json: {e}"))?;
-    m.validate()?;
-    if matches!(m.kind.as_str(), "lua" | "rust") && !files.contains_key(&m.main) {
-        return Err(format!("в архиве нет {}", m.main));
-    }
-    if m.kind == "rust" {
-        super::process::check_binary(&files[&m.main], &m.arch)?;
-    }
-    Ok((files, m))
+    Ok((files, plan.manifest))
 }
 
 pub fn free_mb(dir: &Path) -> u64 {
@@ -117,18 +210,73 @@ pub fn free_mb(dir: &Path) -> u64 {
     0
 }
 
+struct TempFile(std::path::PathBuf);
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn download_to_temp(url: &str, max: usize, path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    let mut resp = crate::net::direct()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| crate::net::short(&e))?;
+    let code = resp.status().as_u16();
+    if code != 200 {
+        return Err(format!("скачивание: ответ {code}"));
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let f = tokio::fs::File::create(path).await.map_err(|e| e.to_string())?;
+    let mut wr = tokio::io::BufWriter::with_capacity(32 * 1024, f);
+    let mut hasher = Sha256::new();
+    let mut written = 0usize;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| crate::net::short(&e))? {
+        written += chunk.len();
+        if written > max {
+            return Err(format!("файл больше {} МБ", max >> 20));
+        }
+        hasher.update(&chunk);
+        wr.write_all(&chunk).await.map_err(|e| e.to_string())?;
+    }
+    wr.flush().await.map_err(|e| e.to_string())?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
 impl Host {
     /// Поставить (или обновить) плагин из zip. source — owner/repo или file.
     pub async fn install(self: &Arc<Self>, raw: &[u8], source: &str, official: bool) -> Result<Installation, String> {
-        self.install_archive(raw, source, official, None, || true).await
+        if raw.len() > ZIP_MAX {
+            return Err(format!("архив плагина больше {} МБ", ZIP_MAX >> 20));
+        }
+        self.install_reader(std::io::Cursor::new(raw), source, official, None, || true).await
     }
 
-    async fn install_archive(self: &Arc<Self>, raw: &[u8], source: &str, official: bool, request: Option<&InstallRequest>, can_apply: impl Fn() -> bool + Send) -> Result<Installation, String> {
+    async fn install_reader<R: Read + std::io::Seek + Send>(
+        self: &Arc<Self>,
+        rd: R,
+        source: &str,
+        official: bool,
+        request: Option<&InstallRequest>,
+        can_apply: impl Fn() -> bool + Send,
+    ) -> Result<Installation, String> {
         let _g = self.install_lock.lock().await; // две установки сразу делили бы одну временную папку
         if !can_apply() {
             return Err(INSTALL_DEFERRED.into());
         }
-        let (files, m) = unpack(raw)?;
+        let mut zr = zip::ZipArchive::new(rd).map_err(|_| "это не zip-архив плагина".to_string())?;
+        let plan = inspect_archive(&mut zr)?;
+        let m = plan.manifest.clone();
+        if plan.total_hint > UNPACK_MAX as u64 {
+            return Err(format!("плагин больше {} МБ в распакованном виде", UNPACK_MAX >> 20));
+        }
         if let Some(request) = request {
             if (official || request.update) && m.id != request.id {
                 return Err("В архиве другой плагин".into());
@@ -175,23 +323,19 @@ impl Host {
         } else {
             None
         };
-        let total: usize = files.values().map(Vec::len).sum();
         let free = free_mb(&self.data_dir);
-        if free > 0 && free < (total >> 20) as u64 + 3 {
-            return Err(format!("мало места на колонке: свободно {free} МБ, плагину нужно {} МБ", (total >> 20) + 1));
+        if free > 0 && free < (plan.total_hint >> 20) + 3 {
+            return Err(format!("мало места на колонке: свободно {free} МБ, плагину нужно {} МБ", (plan.total_hint >> 20) + 1));
         }
         let dst = self.dir().join(&m.id);
         let tmp = self.dir().join(format!("{}.tmp", m.id));
         let _ = std::fs::remove_dir_all(&tmp);
-        for (name, b) in &files {
-            let p = tmp.join(name);
-            std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-            let mode = if m.kind == "rust" && name == &m.main { 0o700 } else { 0o644 };
-            if let Err(e) = crate::settings::write_atomic(&p, b, mode) {
-                let _ = std::fs::remove_dir_all(&tmp);
-                return Err(e.to_string());
-            }
+        std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+        if let Err(e) = unpack_plan_to_dir(&mut zr, &plan, &tmp) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
         }
+        drop(zr);
         if !can_apply() {
             let _ = std::fs::remove_dir_all(&tmp);
             return Err(INSTALL_DEFERRED.into());
@@ -230,6 +374,7 @@ impl Host {
             st.removed = false;
             let en = st.enabled;
             self.save(&g);
+            self.sync_wake_training(&g);
             en
         };
         if enabled && reboot_from.is_none() {
@@ -260,6 +405,7 @@ impl Host {
                         state.state.remove(&m.id);
                     }
                     self.save(&state);
+                    self.sync_wake_training(&state);
                 }
                 if restart {
                     self.start(&m.id).await;
@@ -291,14 +437,17 @@ impl Host {
                 items.iter().any(|item| item["id"] == id && item["kind"] == "rust")
             };
             if native {
-                let raw = download_official_rust(id).await?;
-                return self.install_archive(&raw, crate::DEFAULT_REPO, true, Some(request), can_apply).await;
+                let tmp_path = self.dir().join(format!("{id}.dl.zip"));
+                let _guard = TempFile(tmp_path.clone());
+                download_official_rust(id, &tmp_path).await?;
+                let file = std::fs::File::open(&tmp_path).map_err(|e| e.to_string())?;
+                return self.install_reader(std::io::BufReader::new(file), crate::DEFAULT_REPO, true, Some(request), can_apply).await;
             }
         }
         #[cfg(feature = "lua")]
         if official {
             let raw = download_official_lua(id).await?;
-            return self.install_archive(&raw, crate::DEFAULT_REPO, true, Some(request), can_apply).await;
+            return self.install_reader(std::io::Cursor::new(&raw), crate::DEFAULT_REPO, true, Some(request), can_apply).await;
         }
         let names: Vec<String> = if official {
             if !valid_id(id) {
@@ -322,12 +471,15 @@ impl Host {
         let Some(link) = link.filter(|l| !l.is_empty()) else {
             return Err(format!("в последнем релизе {repo} нет {}", names.join(" или ")));
         };
-        let raw = crate::net::download(&link, ZIP_MAX).await?;
-        self.install_archive(&raw, repo, official, Some(request), can_apply).await
+        let tmp_path = self.dir().join("repo.dl.zip");
+        let _guard = TempFile(tmp_path.clone());
+        download_to_temp(&link, ZIP_MAX, &tmp_path).await?;
+        let file = std::fs::File::open(&tmp_path).map_err(|e| e.to_string())?;
+        self.install_reader(std::io::BufReader::new(file), repo, official, Some(request), can_apply).await
     }
 }
 
-async fn download_official_rust(id: &str) -> Result<Vec<u8>, String> {
+async fn download_official_rust(id: &str, tmp_path: &Path) -> Result<(), String> {
     let asset = format!("plugin-{id}-{}.zip", super::arch());
     let base = if let Some(base) = option_env!("JARVIS_PLUGIN_ASSETS") {
         base.to_owned()
@@ -339,16 +491,17 @@ async fn download_official_rust(id: &str) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("Пакеты для этой версии недоступны: {error}"))?;
     let sums = std::str::from_utf8(&sums).map_err(|_| "Неверный список контрольных сумм")?;
     let expected = jarvis_station::checksum(sums, &asset).ok_or("Для этой архитектуры нет официального пакета")?;
-    let raw = crate::net::download(&format!("{base}/{asset}"), ZIP_MAX).await?;
-    use sha2::{Digest, Sha256};
-    if hex::encode(Sha256::digest(&raw)) != expected {
+    let actual = download_to_temp(&format!("{base}/{asset}"), ZIP_MAX, tmp_path).await?;
+    if actual != expected {
         return Err("Контрольная сумма официального пакета не совпала".into());
     }
-    let (_, manifest) = unpack(&raw)?;
-    if manifest.id != id || manifest.kind != "rust" {
+    let file = std::fs::File::open(tmp_path).map_err(|e| e.to_string())?;
+    let mut zr = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|_| "это не zip-архив плагина".to_string())?;
+    let plan = inspect_archive(&mut zr)?;
+    if plan.manifest.id != id || plan.manifest.kind != "rust" {
         return Err("В архиве другой плагин".into());
     }
-    Ok(raw)
+    Ok(())
 }
 
 fn replace_package(tmp: &Path, dst: &Path, backup: &Path) -> std::io::Result<()> {

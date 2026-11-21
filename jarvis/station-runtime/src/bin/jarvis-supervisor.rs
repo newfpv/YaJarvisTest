@@ -98,7 +98,7 @@ fn supervise(data: &Path, runtime: &Path) -> io::Result<()> {
                         terminate(&mut child);
                         break;
                     }
-                    thread::sleep(Duration::from_millis(200));
+                    thread::sleep(Duration::from_millis(1000));
                 }
             }
             Err(error) if update.is_some() => {

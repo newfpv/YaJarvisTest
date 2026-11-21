@@ -331,12 +331,13 @@ pub async fn brain_request(params: Value) -> Result<Value, String> {
 pub async fn warm_loop(host: Arc<Host>, store: crate::settings::Store) {
     tokio::time::sleep(Duration::from_secs(15)).await; // плагины ещё запускаются
     loop {
-        if store.with(|s| s.active_profile().engine == "chatgpt")
+        if !store.is_night()
+            && store.with(|s| s.active_profile_ref().engine == "chatgpt" && signed_in(&s.chatgpt))
             && let Ok(n) = host.provider("chatgpt")
         {
             let _ = n.request("voice.warm", Value::Null, Duration::from_secs(5)).await;
         }
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(180)).await;
     }
 }
 

@@ -106,14 +106,20 @@ pub fn memory_state(s: &Settings, host: &crate::plugins::Host) -> Value {
     })
 }
 
-fn security_checks() -> Value {
-    let listening = |port: u16| {
-        std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), std::time::Duration::from_millis(300)).is_ok()
+async fn security_checks() -> Value {
+    let listening = |port: u16| async move {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::net::TcpStream::connect(([127, 0, 0, 1], port)),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok())
     };
+    let (adb, ssh) = tokio::join!(listening(5555), listening(2222));
     json!([
-        {"id": "adb", "title": "ADB по сети (порт 5555)", "open": listening(5555),
+        {"id": "adb", "title": "ADB по сети (порт 5555)", "open": adb,
          "hint": "Через ADB любой в вашей Wi-Fi сети получает полный доступ к колонке без пароля. Нужен только для установки и обновления — потом его можно закрыть в программе установки."},
-        {"id": "ssh", "title": "SSH (порт 2222)", "open": listening(2222),
+        {"id": "ssh", "title": "SSH (порт 2222)", "open": ssh,
          "hint": "Удалённый вход в консоль колонки. Если не пользуетесь — лучше закрыть; если пользуетесь — только по ключу."},
     ])
 }
@@ -203,7 +209,7 @@ pub async fn state(State(app): State<App>) -> Json<Value> {
         "stt_plugins": app.plugins.stt_plugins(),
         "tts_plugins": app.plugins.tts_plugins(),
         "repo": crate::DEFAULT_REPO,
-        "security": security_checks(),
+        "security": security_checks().await,
     });
     let o = out.as_object_mut().unwrap();
     for (k, v) in catalog() {

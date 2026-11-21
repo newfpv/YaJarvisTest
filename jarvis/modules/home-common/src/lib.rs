@@ -200,6 +200,7 @@ pub fn load(path: &Path) -> Result<Value, String> {
     }
     serde_json::from_slice(&bytes).map_err(|_| "Неверный кеш устройств".into())
 }
+#[cfg(feature = "qr")]
 pub fn qr(text: &str) -> Result<String, String> {
     use qrcode::{Color, EcLevel, QrCode};
     let code = QrCode::with_error_correction_level(text.as_bytes(), EcLevel::Q)

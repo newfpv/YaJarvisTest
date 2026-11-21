@@ -9,7 +9,10 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
 };
 
 /// Go пишет пустой список как null: читаем его как пустой.
@@ -432,11 +435,15 @@ pub fn has_all(v: &Value, keys: &[&str]) -> bool {
 }
 
 impl Settings {
-    pub fn active_profile(&self) -> Profile {
+    pub fn active_profile_ref(&self) -> Option<&Profile> {
         self.profiles
             .iter()
             .find(|p| p.id == self.active)
             .or_else(|| self.profiles.first())
+    }
+
+    pub fn active_profile(&self) -> Profile {
+        self.active_profile_ref()
             .cloned()
             .unwrap_or_else(|| Settings::default().profiles.remove(0))
     }
@@ -451,8 +458,7 @@ impl Settings {
         jiff::Timestamp::now().to_zoned(tz)
     }
 
-    /// Сейчас ночь по расписанию (интервал может переходить через полночь).
-    pub fn is_night(&self) -> bool {
+    pub fn is_night_in(&self, tz: &jiff::tz::TimeZone) -> bool {
         if !self.night.enabled {
             return false;
         }
@@ -460,19 +466,25 @@ impl Settings {
         if from == to {
             return false;
         }
-        let t = self.now();
+        let t = jiff::Timestamp::now().to_zoned(tz.clone());
         let now = t.hour() as i64 * 60 + t.minute() as i64;
         if from < to { now >= from && now < to } else { now >= from || now < to }
+    }
+
+    /// Сейчас ночь по расписанию (интервал может переходить через полночь).
+    pub fn is_night(&self) -> bool {
+        let tz = jiff::tz::TimeZone::get(&self.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
+        self.is_night_in(&tz)
     }
 
     /// Подсветка активного ассистента с общим выключателем.
     pub fn led_for(&self) -> LedSettings {
         let mut l = self.led.clone();
-        if let Some(p) = self.active_profile().led {
+        if let Some(p) = self.active_profile_ref().and_then(|p| p.led.as_ref()) {
             l.brightness = p.brightness;
-            l.listening = p.listening;
-            l.thinking = p.thinking;
-            l.speaking = p.speaking;
+            l.listening = p.listening.clone();
+            l.thinking = p.thinking.clone();
+            l.speaking = p.speaking.clone();
         }
         if self.is_night() {
             l.brightness = l.brightness.min(self.night.bright);
@@ -480,17 +492,22 @@ impl Settings {
         l
     }
 
-    /// Громкость голоса активного ассистента.
-    pub fn voice_volume(&self) -> i64 {
+    pub fn voice_volume_in(&self, tz: &jiff::tz::TimeZone) -> i64 {
         let mut v = self.volume;
-        let pv = self.active_profile().volume;
+        let pv = self.active_profile_ref().map_or(0, |p| p.volume);
         if pv > 0 {
             v = pv;
         }
-        if self.is_night() {
+        if self.is_night_in(tz) {
             v = v.min(self.night.voice);
         }
         v
+    }
+
+    /// Громкость голоса активного ассистента.
+    pub fn voice_volume(&self) -> i64 {
+        let tz = jiff::tz::TimeZone::get(&self.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
+        self.voice_volume_in(&tz)
     }
 
     pub fn home_connected(&self, ch: &str) -> bool {
@@ -549,11 +566,50 @@ impl Settings {
     }
 }
 
+struct Hot {
+    wake_enabled: AtomicBool,
+    mic_boost_db: AtomicI64,
+    mic_gain_db: AtomicI64,
+    wake_sensitivity: AtomicI64,
+    train_mode: AtomicBool,
+    train_limit_mb: AtomicI64,
+    tz: RwLock<jiff::tz::TimeZone>,
+}
+
+impl Hot {
+    fn parse_tz(name: &str) -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::get(name).unwrap_or(jiff::tz::TimeZone::UTC)
+    }
+
+    fn new(s: &Settings) -> Self {
+        Self {
+            wake_enabled: AtomicBool::new(s.wake_enabled),
+            mic_boost_db: AtomicI64::new(s.mic_boost_db),
+            mic_gain_db: AtomicI64::new(s.mic_gain_db),
+            wake_sensitivity: AtomicI64::new(s.wake_sensitivity),
+            train_mode: AtomicBool::new(s.train_mode),
+            train_limit_mb: AtomicI64::new(s.train_limit_mb),
+            tz: RwLock::new(Self::parse_tz(&s.timezone)),
+        }
+    }
+
+    fn sync(&self, s: &Settings) {
+        self.wake_enabled.store(s.wake_enabled, Ordering::Relaxed);
+        self.mic_boost_db.store(s.mic_boost_db, Ordering::Relaxed);
+        self.mic_gain_db.store(s.mic_gain_db, Ordering::Relaxed);
+        self.wake_sensitivity.store(s.wake_sensitivity, Ordering::Relaxed);
+        self.train_mode.store(s.train_mode, Ordering::Relaxed);
+        self.train_limit_mb.store(s.train_limit_mb, Ordering::Relaxed);
+        *self.tz.write().unwrap() = Self::parse_tz(&s.timezone);
+    }
+}
+
 /// Хранилище настроек: читать можно без гонок (копия), менять — через update().
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<RwLock<Settings>>,
     path: Arc<PathBuf>,
+    hot: Arc<Hot>,
 }
 
 impl Store {
@@ -566,7 +622,8 @@ impl Store {
         };
         let Some(data) = data else {
             let s = Settings { vol_scale: 2, ..Default::default() }; // новая установка — сразу в новой шкале громкости
-            let st = Store { inner: Arc::new(RwLock::new(s)), path: Arc::new(path) };
+            let hot = Arc::new(Hot::new(&s));
+            let st = Store { inner: Arc::new(RwLock::new(s)), path: Arc::new(path), hot };
             st.save(&st.inner.read().unwrap())?;
             st.apply_seed()?;
             return Ok(st);
@@ -580,12 +637,46 @@ impl Store {
             s.auto_once = 1;
             dirty = true;
         }
-        let st = Store { inner: Arc::new(RwLock::new(s)), path: Arc::new(path) };
+        let hot = Arc::new(Hot::new(&s));
+        let st = Store { inner: Arc::new(RwLock::new(s)), path: Arc::new(path), hot };
         if dirty {
             st.save(&st.inner.read().unwrap())?;
         }
         st.apply_seed()?;
         Ok(st)
+    }
+
+    pub fn wake_enabled(&self) -> bool { self.hot.wake_enabled.load(Ordering::Relaxed) }
+    pub fn mic_boost_db(&self) -> i64 { self.hot.mic_boost_db.load(Ordering::Relaxed) }
+    pub fn mic_gain_db(&self) -> i64 { self.hot.mic_gain_db.load(Ordering::Relaxed) }
+    pub fn wake_sensitivity(&self) -> i64 { self.hot.wake_sensitivity.load(Ordering::Relaxed) }
+    pub fn train_mode(&self) -> bool { self.hot.train_mode.load(Ordering::Relaxed) }
+    pub fn train_limit_mb(&self) -> i64 { self.hot.train_limit_mb.load(Ordering::Relaxed) }
+    pub fn timezone(&self) -> jiff::tz::TimeZone { self.hot.tz.read().unwrap().clone() }
+    pub fn now(&self) -> jiff::Zoned { jiff::Timestamp::now().to_zoned(self.timezone()) }
+    pub fn is_night(&self) -> bool {
+        let tz = self.timezone();
+        self.with(|s| s.is_night_in(&tz))
+    }
+    pub fn voice_volume(&self) -> i64 {
+        let tz = self.timezone();
+        self.with(|s| s.voice_volume_in(&tz))
+    }
+    pub fn led_for(&self) -> LedSettings {
+        let tz = self.timezone();
+        self.with(|s| {
+            let mut l = s.led.clone();
+            if let Some(p) = s.active_profile_ref().and_then(|p| p.led.as_ref()) {
+                l.brightness = p.brightness;
+                l.listening = p.listening.clone();
+                l.thinking = p.thinking.clone();
+                l.speaking = p.speaking.clone();
+            }
+            if s.is_night_in(&tz) {
+                l.brightness = l.brightness.min(s.night.bright);
+            }
+            l
+        })
     }
 
     /// Копия настроек.
@@ -604,6 +695,7 @@ impl Store {
         let mut next = g.clone();
         f(&mut next)?;
         self.save(&next)?;
+        self.hot.sync(&next);
         *g = next;
         Ok(())
     }

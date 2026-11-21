@@ -154,7 +154,7 @@ impl Vpn {
 async fn serve(
     listener: TcpListener,
     config: Arc<Config>,
-    tls: Arc<rustls::ClientConfig>,
+    tls: Arc<reality_tls::ClientConfig>,
     user: Vec<u8>,
     pass: Vec<u8>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
@@ -181,7 +181,7 @@ async fn serve(
 async fn connection(
     mut socket: TcpStream,
     config: Arc<Config>,
-    tls: Arc<rustls::ClientConfig>,
+    tls: Arc<reality_tls::ClientConfig>,
     credentials: Arc<(Vec<u8>, Vec<u8>)>,
     udp_limit: Arc<tokio::sync::Semaphore>,
 ) {

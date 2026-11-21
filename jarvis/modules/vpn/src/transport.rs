@@ -2,17 +2,30 @@ use crate::{
     config::Config,
     protocol::{BoxIo, Target, VlessIo},
 };
-use rustls::{
-    ClientConfig, RootCertStore,
+use reality_tls::{
+    ClientConfig, ClientConnection, RootCertStore,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::CryptoProvider,
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{Arc, LazyLock},
+};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
+static ROOTS: LazyLock<Arc<RootCertStore>> = LazyLock::new(|| {
+    Arc::new(RootCertStore::from_iter(
+        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+    ))
+});
+
+pub(crate) fn root_store() -> Arc<RootCertStore> {
+    ROOTS.clone()
+}
+
 pub(crate) fn tls_config(config: &Config) -> Result<Arc<ClientConfig>, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(reality_tls::crypto::ring::default_provider());
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|_| "Не настроить TLS VPN")?;
@@ -23,9 +36,7 @@ pub(crate) fn tls_config(config: &Config) -> Result<Arc<ClientConfig>, String> {
             .with_no_client_auth()
     } else {
         builder
-            .with_root_certificates(RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            ))
+            .with_root_certificates(root_store())
             .with_no_client_auth()
     };
     if config.websocket {
@@ -82,11 +93,10 @@ pub(crate) async fn dial_command(
     let mut io: BoxIo = if config.tls {
         let name = ServerName::try_from(config.server_name.clone())
             .map_err(|_| io::Error::other("invalid VPN SNI"))?;
-        Box::new(
-            tokio_rustls::TlsConnector::from(tls)
-                .connect(name, socket)
-                .await?,
-        )
+        let conn = ClientConnection::new(tls, name).map_err(io::Error::other)?;
+        let mut stream = crate::tls_io::TlsIo::new(Box::new(socket), conn);
+        stream.handshake().await?;
+        Box::new(stream)
     } else {
         Box::new(socket)
     };
@@ -110,16 +120,16 @@ impl ServerCertVerifier for Insecure {
         _: &ServerName<'_>,
         _: &[u8],
         _: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
+    ) -> Result<ServerCertVerified, reality_tls::Error> {
         Ok(ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(
         &self,
         msg: &[u8],
         cert: &CertificateDer<'_>,
-        signature: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
+        signature: &reality_tls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, reality_tls::Error> {
+        reality_tls::crypto::verify_tls12_signature(
             msg,
             cert,
             signature,
@@ -130,16 +140,16 @@ impl ServerCertVerifier for Insecure {
         &self,
         msg: &[u8],
         cert: &CertificateDer<'_>,
-        signature: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
+        signature: &reality_tls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, reality_tls::Error> {
+        reality_tls::crypto::verify_tls13_signature(
             msg,
             cert,
             signature,
             &self.0.signature_verification_algorithms,
         )
     }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+    fn supported_verify_schemes(&self) -> Vec<reality_tls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }

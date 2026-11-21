@@ -68,6 +68,7 @@ impl Mic {
     pub fn run(self: Arc<Self>) {
         thread::Builder::new()
             .name("mic".into())
+            .stack_size(128 * 1024)
             .spawn(move || {
                 loop {
                     if let Err(e) = self.serve() {
@@ -117,6 +118,8 @@ struct Playing {
     lim: Limiter,
     up: Option<Upsampler>,
     boost: f64,
+    shaped: Vec<i16>,
+    up_buf: Vec<i16>,
 }
 
 /// Плеер: один ответ = один процесс aplay. Стоп — SIGINT: aplay сам корректно отцепляется от dmix.
@@ -151,8 +154,8 @@ impl Player {
             .spawn()?;
         let stdin = child.stdin.take().unwrap();
         let (tx, rx) = sync_channel::<Vec<u8>>(512);
-        let pump = thread::spawn(move || pump(stdin, rx));
-        *self.cur.lock().unwrap() = Some(Playing { child, queue: Some(tx), pump: Some(pump), lim: Limiter::new(rate), up, boost: 1.0 });
+        let pump = thread::Builder::new().name("aplay-pump".into()).stack_size(128 * 1024).spawn(move || pump(stdin, rx))?;
+        *self.cur.lock().unwrap() = Some(Playing { child, queue: Some(tx), pump: Some(pump), lim: Limiter::new(rate), up, boost: 1.0, shaped: Vec::new(), up_buf: Vec::new() });
         Ok(())
     }
 
@@ -172,11 +175,22 @@ impl Player {
         if p.boost > 0.0 {
             g *= p.boost;
         }
-        let mut shaped: Vec<i16> = pcm.iter().map(|&s| p.lim.next(s as f64 * g)).collect();
-        if let Some(up) = p.up.as_mut() {
-            shaped = up.run(&shaped);
+        let g = g as f32;
+        p.shaped.clear();
+        p.shaped.reserve(pcm.len());
+        for &s in pcm {
+            p.shaped.push(p.lim.next_f32(s as f32 * g));
         }
-        let b: Vec<u8> = shaped.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let src: &[i16] = if let Some(up) = p.up.as_mut() {
+            up.run_into(&p.shaped, &mut p.up_buf);
+            &p.up_buf
+        } else {
+            &p.shaped
+        };
+        let mut b = Vec::with_capacity(src.len() * 2);
+        for &s in src {
+            b.extend_from_slice(&s.to_le_bytes());
+        }
         let q = p.queue.as_ref().ok_or("плеер закрыт")?;
         q.try_send(b).map_err(|_| "плеер не успевает")
     }

@@ -316,9 +316,7 @@ fn standard_client(config: &Config) -> Result<tls::ClientConnection, String> {
             .with_no_client_auth()
     } else {
         builder
-            .with_root_certificates(tls::RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            ))
+            .with_root_certificates(crate::transport::root_store())
             .with_no_client_auth()
     };
     tls::ClientConnection::new(

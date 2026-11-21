@@ -10,38 +10,84 @@ pub struct System {
     pub wifi_dbm:i32, pub uptime_s:u64, pub disk_free_mb:u64, pub disk_total_mb:u64,
 }
 #[derive(Clone,Default,Serialize)]
-pub struct Point { pub t:i64, pub cpu:f64, pub temp:f64, pub mem:u64, pub wifi:i32, pub disk:u64, pub load:f64, pub me:f64 }
+pub struct Point { pub t:i64, pub cpu:f32, pub temp:f32, pub mem:u32, pub wifi:i16, pub disk:u32, pub load:f32, pub me:f32 }
 #[derive(Clone,Copy,Default)]
 struct Cpu {busy:u64,total:u64,own:u64}
 #[derive(Default)]
-struct State {sys:System, points:VecDeque<Point>, cpu:Option<Cpu>, sampled:Option<Instant>}
+struct State {
+    sys: System,
+    points: VecDeque<Point>,
+    cpu: Option<Cpu>,
+    sampled: Option<Instant>,
+    data: Option<PathBuf>,
+    live_at: Option<Instant>,
+    wifi_at: Option<Instant>,
+    wifi_val: i32,
+}
 #[derive(Default)]
 pub struct Telemetry {state:Mutex<State>}
 
 impl Telemetry {
     pub fn start(data:PathBuf)->Arc<Self> {
-        let result=Arc::new(Self::default());let weak=Arc::downgrade(&result);
+        let result=Arc::new(Self::default());
+        result.state.lock().unwrap().data=Some(data.clone());
+        let weak=Arc::downgrade(&result);
         tokio::spawn(async move {
-            let mut timer=tokio::time::interval(Duration::from_secs(2));timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut wifi=(None::<Instant>,0);
+            let mut timer=tokio::time::interval(Duration::from_secs(EVERY));timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 timer.tick().await;let Some(metrics)=weak.upgrade()else{break;};
                 let root=data.clone();let Ok((mut sys,cpu))=tokio::task::spawn_blocking(move||read(&root)).await else{continue;};
                 if sys.wifi_dbm==0 {
-                    if wifi.0.is_none_or(|at|at.elapsed()>=Duration::from_secs(10)) {
-                        wifi=(Some(Instant::now()),wifi_fallback().await);
-                    }
-                    sys.wifi_dbm=wifi.1;
+                    sys.wifi_dbm=metrics.resolve_wifi().await;
                 }
                 metrics.record(sys,cpu,unix(),Instant::now());
             }
         });result
     }
+    async fn resolve_wifi(&self)->i32 {
+        let cached={
+            let state=self.state.lock().unwrap();
+            state.wifi_at.is_some_and(|at|at.elapsed()<Duration::from_secs(EVERY)).then_some(state.wifi_val)
+        };
+        if let Some(v)=cached {return v;}
+        let v=wifi_fallback().await;
+        let mut state=self.state.lock().unwrap();
+        state.wifi_at=Some(Instant::now());
+        state.wifi_val=v;
+        v
+    }
+    pub async fn live_system(&self)->System {
+        let data={
+            let state=self.state.lock().unwrap();
+            if state.live_at.is_some_and(|at|at.elapsed()<Duration::from_secs(2)) {
+                return state.sys.clone();
+            }
+            state.data.clone()
+        };
+        let Some(root)=data else{return self.system();};
+        let Ok((mut sys,_))=tokio::task::spawn_blocking(move||read(&root)).await else{return self.system();};
+        if sys.wifi_dbm==0 {
+            sys.wifi_dbm=self.resolve_wifi().await;
+        }
+        let mut state=self.state.lock().unwrap();
+        state.sys=sys.clone();
+        state.live_at=Some(Instant::now());
+        sys
+    }
     fn record(&self,sys:System,cpu:Option<Cpu>,now:i64,at:Instant) {
-        let mut state=self.state.lock().unwrap();state.sys=sys.clone();
+        let mut state=self.state.lock().unwrap();state.sys=sys.clone();state.live_at=Some(at);
         if state.sampled.is_some_and(|last|at.duration_since(last)<Duration::from_secs(EVERY)){return;}
         let (usage,own)=cpu.zip(state.cpu).map(|(current,previous)|cpu_delta(current,previous)).unwrap_or_default();
-        let point=Point {t:now,cpu:usage,me:own,temp:sys.temp_c,mem:sys.mem_total_mb.saturating_sub(sys.mem_avail_mb),wifi:sys.wifi_dbm,disk:sys.disk_free_mb,load:sys.load1};
+        let point=Point {
+            t:now,
+            cpu:usage as f32,
+            me:own as f32,
+            temp:sys.temp_c as f32,
+            mem:sys.mem_total_mb.saturating_sub(sys.mem_avail_mb).min(u32::MAX as u64) as u32,
+            wifi:sys.wifi_dbm.clamp(i16::MIN as i32,i16::MAX as i32) as i16,
+            disk:sys.disk_free_mb.min(u32::MAX as u64) as u32,
+            load:sys.load1 as f32,
+        };
         state.cpu=cpu;state.sampled=Some(at);state.points.push_back(point);
         while state.points.len()>KEEP{state.points.pop_front();}
     }

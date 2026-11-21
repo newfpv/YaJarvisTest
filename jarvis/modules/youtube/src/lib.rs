@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, OnceCell, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, OnceCell, oneshot},
     task::JoinHandle,
 };
 
@@ -112,7 +112,7 @@ pub struct Youtube {
     state: Mutex<State>,
     ready: OnceCell<()>,
     request: AsyncMutex<()>,
-    warm: Mutex<Option<JoinHandle<()>>>,
+    wake: Notify,
     closed: AtomicBool,
     gain: AtomicU32,
 }
@@ -127,7 +127,7 @@ impl Youtube {
             state: Mutex::default(),
             ready: OnceCell::default(),
             request: AsyncMutex::default(),
-            warm: Mutex::default(),
+            wake: Notify::new(),
             closed: AtomicBool::new(false),
             gain: AtomicU32::new(0.8f32.to_bits()),
         }
@@ -175,25 +175,17 @@ impl Youtube {
 
     pub fn watch(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
-        let preload = weak.clone();
-        *self.warm.lock().unwrap() = Some(tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            if let Some(service) = preload.upgrade() {
-                if let Err(error) = service.remote.warm().await {
-                    log::debug!("YouTube: прогрев плеера: {error}");
-                }
-            }
-        }));
         tokio::spawn(async move {
-            let mut clock = tokio::time::interval(Duration::from_millis(500));
             let mut last = Value::Null;
             loop {
-                clock.tick().await;
                 let Some(service) = weak.upgrade() else { break };
                 if service.closed.load(Ordering::Acquire) {
                     break;
                 }
-                let mut state = service.state.lock().unwrap().current();
+                let (mut state, playing) = {
+                    let st = service.state.lock().unwrap();
+                    (st.current(), st.phase == Phase::Playing)
+                };
                 state["pos"] = state["pos"].as_f64().unwrap_or_default().floor().into();
                 if state != last {
                     if state["playing"] == true && last["playing"] != true {
@@ -201,6 +193,19 @@ impl Youtube {
                     }
                     service.event("music.state", state.clone()).await;
                     last = state;
+                }
+                if playing {
+                    tokio::select! {
+                        _ = service.wake.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
+                } else {
+                    tokio::select! {
+                        _ = service.wake.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(600)) => {
+                            service.remote.evict_idle(Duration::from_secs(600)).await;
+                        }
+                    }
                 }
             }
         });
@@ -215,10 +220,8 @@ impl Youtube {
 
     pub async fn stop(&self) {
         self.closed.store(true, Ordering::Release);
+        self.wake.notify_one();
         self.account.close();
-        if let Some(task) = self.warm.lock().unwrap().take() {
-            task.abort();
-        }
         self.halt(false).await;
         self.emit_state().await;
         self.host.close();
@@ -294,6 +297,7 @@ impl Youtube {
             }
             (active, state.generation, state.task.take())
         };
+        self.wake.notify_one();
         if let Some(task) = task {
             task.abort();
             let _ = task.await;
@@ -375,6 +379,7 @@ impl Youtube {
         state.pos = start;
         state.error.clear();
         state.saved = None;
+        self.wake.notify_one();
         let service = self.clone();
         state.task = Some(tokio::spawn(async move {
             service.run(generation, tracks, start, stream, notify).await;
@@ -429,6 +434,7 @@ impl Youtube {
                 state.stream = Some(source.clone());
                 state.pos = start;
                 state.phase = Phase::Loading;
+                self.wake.notify_one();
                 state.personal |= interesting("", &track);
                 state.related = if radio && !state.personal {
                     pending.clone()
@@ -463,6 +469,7 @@ impl Youtube {
                         first
                     };
                     if first {
+                        service.wake.notify_one();
                         if needs_related {
                             let service = self.clone();
                             let seed = track.id.clone();
@@ -565,6 +572,7 @@ impl Youtube {
             state.related.clear();
             state.error = last.clone();
         }
+        self.wake.notify_one();
         if let Some(notify) = notify {
             let _ = notify.send(Err(if last.is_empty() {
                 "YouTube ничего не нашёл".into()

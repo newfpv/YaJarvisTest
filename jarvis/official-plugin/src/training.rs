@@ -41,16 +41,24 @@ impl Training {
                     .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
                     .collect();
                 let rt = tokio::runtime::Handle::current();
+                let collect = params["collect"] == true;
+                let hit = params["hit"].as_bool().unwrap_or(false);
+                let discard = params["discard"].as_bool().unwrap_or(true);
+                self.records.background.frame(&rt, &pcm, discard || hit);
                 let mut ring = self.ring.lock().unwrap();
+                if !collect {
+                    if !ring.is_empty() {
+                        ring.clear();
+                        ring.shrink_to_fit();
+                    }
+                    return Ok(Value::Null);
+                }
                 if ring.len() + pcm.len() > RATE * 6 {
                     let skip = ring.len().saturating_sub(RATE * 3);
                     ring.drain(..skip);
                 }
                 ring.extend_from_slice(&pcm);
-                let hit = params["hit"].as_bool().unwrap_or(false);
-                let discard = params["discard"].as_bool().unwrap_or(true);
-                self.records.background.frame(&rt, &pcm, discard || hit);
-                if !discard && params["collect"] == true {
+                if !discard {
                     let prob = params["prob"].as_f64().unwrap_or(0.) as f32;
                     let loud = pcm.iter().any(|sample| !(-600..=600).contains(sample));
                     if let Some(kind) = self.records.sample_kind(hit, prob, loud) {

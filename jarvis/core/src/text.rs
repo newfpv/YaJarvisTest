@@ -34,7 +34,13 @@ impl Engine {
         };
         let result=tokio::select!{
             value=tokio::time::timeout(Duration::from_secs(90),work)=>value.unwrap_or_else(|_|Err("Запрос не завершился за 90 с".into())),
-            _=async{loop{if self.speech_epoch.load(Ordering::SeqCst)!=epoch{break;}tokio::time::sleep(Duration::from_millis(50)).await;}}=>Err("Запрос отменён".into()),
+            _=async{
+                loop {
+                    let wait = self.speech_notify.notified();
+                    if self.speech_epoch.load(Ordering::SeqCst) != epoch { break; }
+                    wait.await;
+                }
+            }=>Err("Запрос отменён".into()),
         };
         self.journal.update(id,|t|{t.live=false;match &result{Ok(answer)=>t.answer=answer.clone(),Err(error)=>t.error=error.clone()}});
         self.journal.remember(id);

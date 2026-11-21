@@ -91,6 +91,117 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     (s0 + s1) + (s2 + s3)
 }
 
+/// Предвычисленный БПФ вещественного сигнала в `f32` без тригонометрии на кадрах (NEON-дружественный).
+pub(crate) struct Rfft {
+    m: usize,
+    bitrev: Vec<usize>,
+    stage_re: Vec<Vec<f32>>,
+    stage_im: Vec<Vec<f32>>,
+    unp_re: Vec<f32>,
+    unp_im: Vec<f32>,
+    re: Vec<f32>,
+    im: Vec<f32>,
+}
+
+impl Rfft {
+    pub(crate) fn new(n: usize) -> Self {
+        assert!(n >= 4 && n.is_power_of_two());
+        let m = n / 2;
+        let bits = m.trailing_zeros() as usize;
+        let bitrev = (0..m).map(|i| i.reverse_bits() >> (usize::BITS as usize - bits)).collect();
+        let mut stage_re = Vec::with_capacity(bits);
+        let mut stage_im = Vec::with_capacity(bits);
+        let mut size = 2;
+        while size <= m {
+            let half = size / 2;
+            let mut sre = Vec::with_capacity(half);
+            let mut sim = Vec::with_capacity(half);
+            for k in 0..half {
+                let ang = -2.0 * std::f64::consts::PI * k as f64 / size as f64;
+                sre.push(ang.cos() as f32);
+                sim.push(ang.sin() as f32);
+            }
+            stage_re.push(sre);
+            stage_im.push(sim);
+            size <<= 1;
+        }
+        let mut unp_re = Vec::with_capacity(m / 2);
+        let mut unp_im = Vec::with_capacity(m / 2);
+        for k in 0..m / 2 {
+            let ang = -2.0 * std::f64::consts::PI * k as f64 / n as f64;
+            unp_re.push(ang.cos() as f32);
+            unp_im.push(ang.sin() as f32);
+        }
+        Rfft {
+            m,
+            bitrev,
+            stage_re,
+            stage_im,
+            unp_re,
+            unp_im,
+            re: vec![0.0; m],
+            im: vec![0.0; m],
+        }
+    }
+
+    /// Квадрат модуля спектра `input[0..n]` в `out[0..=n/2]`.
+    pub(crate) fn power(&mut self, input: &[f32], out: &mut [f32]) {
+        let m = self.m;
+        debug_assert_eq!(input.len(), m * 2);
+        debug_assert_eq!(out.len(), m + 1);
+        for (k, &rev) in self.bitrev.iter().enumerate() {
+            self.re[rev] = input[k * 2];
+            self.im[rev] = input[k * 2 + 1];
+        }
+        let mut half = 1;
+        for (sre, sim) in self.stage_re.iter().zip(&self.stage_im) {
+            let size = half * 2;
+            for start in (0..m).step_by(size) {
+                let (re_lo, re_hi) = self.re[start..start + size].split_at_mut(half);
+                let (im_lo, im_hi) = self.im[start..start + size].split_at_mut(half);
+                for k in 0..half {
+                    let wr = sre[k];
+                    let wi = sim[k];
+                    let br = re_hi[k];
+                    let bi = im_hi[k];
+                    let tr = br * wr - bi * wi;
+                    let ti = br * wi + bi * wr;
+                    re_hi[k] = re_lo[k] - tr;
+                    im_hi[k] = im_lo[k] - ti;
+                    re_lo[k] += tr;
+                    im_lo[k] += ti;
+                }
+            }
+            half = size;
+        }
+        let r0 = self.re[0];
+        let i0 = self.im[0];
+        out[0] = (r0 + i0) * (r0 + i0);
+        out[m] = (r0 - i0) * (r0 - i0);
+        let q = m / 2;
+        if m >= 2 {
+            out[q] = self.re[q] * self.re[q] + self.im[q] * self.im[q];
+        }
+        for k in 1..q {
+            let mk = m - k;
+            let er = 0.5 * (self.re[k] + self.re[mk]);
+            let ei = 0.5 * (self.im[k] - self.im[mk]);
+            let or = 0.5 * (self.im[k] + self.im[mk]);
+            let oi = -0.5 * (self.re[k] - self.re[mk]);
+            let wr = self.unp_re[k];
+            let wi = self.unp_im[k];
+            let tr = or * wr - oi * wi;
+            let ti = or * wi + oi * wr;
+            let pr = er + tr;
+            let pi = ei + ti;
+            let nr = er - tr;
+            let ni = ei - ti;
+            out[k] = pr * pr + pi * pi;
+            out[mk] = nr * nr + ni * ni;
+        }
+    }
+}
+
 /// Чтение моделей: little-endian u32 и f32 подряд.
 pub(crate) struct Bin<'a> {
     b: &'a [u8],
@@ -141,5 +252,27 @@ mod tests {
         let mut d = vec![1.0, 1.0];
         gemv(&mut d, &[1.0, 2.0], &[1.0, 2.0, 3.0, 4.0], 2);
         assert_eq!(d, vec![8.0, 11.0]);
+    }
+
+    #[test]
+    fn rfft_matches_reference_fft() {
+        let mut x = [0f32; 512];
+        let mut re = [0f64; 512];
+        let mut im = [0f64; 512];
+        let mut seed = 42u32;
+        for i in 0..512 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            x[i] = ((seed >> 16) as f32 / 32768.0) - 1.0;
+            re[i] = x[i] as f64;
+        }
+        fft(&mut re, &mut im);
+        let mut rfft = Rfft::new(512);
+        let mut got = [0f32; 257];
+        rfft.power(&x, &mut got);
+        for b in 0..257 {
+            let want = (re[b] * re[b] + im[b] * im[b]) as f32;
+            let err = (got[b] - want).abs();
+            assert!(err <= want.abs() * 1e-4 + 1e-4, "bin {b}: got {got_b} want {want}", got_b = got[b]);
+        }
     }
 }

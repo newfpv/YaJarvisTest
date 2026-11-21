@@ -24,6 +24,8 @@ struct Vol {
     pct: Option<f64>,
     pct_at: Option<Instant>,
     pct_busy: bool,
+    log_meta: [(u64, u64); 4],
+    log_cached: (Option<f64>, String),
 }
 
 static VOL: LazyLock<Mutex<Vol>> = LazyLock::new(Mutex::default);
@@ -85,6 +87,27 @@ const MARKER: &str = "Changed volume to ";
 
 /// Самая свежая по времени строка с уровнем из всех журналов: уровень и её метка.
 fn alice_volume_log() -> (Option<f64>, String) {
+    let mut meta = [(0u64, 0u64); 4];
+    for (i, p) in VOL_LOGS.iter().enumerate() {
+        if let Ok(m) = std::fs::metadata(p) {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs().saturating_mul(1_000_000_000).saturating_add(d.subsec_nanos() as u64))
+                .unwrap_or(0);
+            meta[i] = (m.len(), mtime);
+        }
+    }
+    if meta == [(0, 0); 4] {
+        return (None, String::new());
+    }
+    {
+        let st = VOL.lock().unwrap();
+        if st.log_meta == meta {
+            return st.log_cached.clone();
+        }
+    }
     let mut best: (Option<f64>, String) = (None, String::new());
     for p in VOL_LOGS {
         if let (Some(v), stamp) = last_volume_in(p)
@@ -93,6 +116,9 @@ fn alice_volume_log() -> (Option<f64>, String) {
             best = (Some(v), stamp);
         }
     }
+    let mut st = VOL.lock().unwrap();
+    st.log_meta = meta;
+    st.log_cached = best.clone();
     best
 }
 
@@ -273,24 +299,25 @@ pub fn night_cap(store: &Store) {
     log::info!("ночной режим: громкость колонки {v} → {cap}");
 }
 
-/// Следить за ночью раз в полминуты; на переходе день↔ночь перенастроить кольцо.
+/// Следить за ночью раз в минуту; на переходе день↔ночь перенастроить кольцо.
 pub fn watch_night(store: Store, leds: std::sync::Arc<Leds>) {
-    std::thread::spawn(move || {
+    tokio::spawn(async move {
         let mut was = false;
         loop {
-            let night = store.with(|s| s.is_night());
+            let night = store.is_night();
             if night != was {
                 was = night;
-                leds.configure(&store.with(|s| s.led_for()));
+                leds.configure(&store.led_for());
                 if night {
                     let (from, to) = store.with(|s| (s.night.from.clone(), s.night.to.clone()));
                     log::info!("ночной режим: начался ({from}–{to})");
                 }
             }
             if night {
-                night_cap(&store);
+                let s = store.clone();
+                let _ = tokio::task::spawn_blocking(move || night_cap(&s)).await;
             }
-            std::thread::sleep(Duration::from_secs(30));
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
 }

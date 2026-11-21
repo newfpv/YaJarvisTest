@@ -48,6 +48,7 @@ impl Official {
         let input = child.stdin.take().ok_or("Нет stdin плагина")?;
         let output = child.stdout.take().ok_or("Нет stdout плагина")?;
         let id = manifest.id.clone();
+        let exit_host = host.clone();
         let peer = Peer::open(
             output,
             input,
@@ -83,6 +84,9 @@ impl Official {
             }
             link.close();
             done.send_replace(true);
+            if let Some(host) = exit_host.upgrade() {
+                host.refresh_wake_training();
+            }
         });
         let handshake = peer
             .call(

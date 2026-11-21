@@ -65,42 +65,199 @@ pub fn text(text: &str, silent: bool) -> Result<(), String> {
 
 pub const MAIND_LOG: &str = "/data/quasar/daemons_logs/maind.log";
 
-/// Читать новые строки журнала maind (переживает ротацию): каждая строка — в on_line. Свой поток.
+/// Читать новые строки журнала (переживает ротацию): каждая строка — в on_line. Общий поток.
 pub fn follow_log(path: &'static str, on_line: impl Fn(&str) + Send + 'static) {
+    follow_logs(vec![(path, Box::new(on_line))]);
+}
+
+pub fn follow_logs(watches: Vec<(&'static str, Box<dyn Fn(&str) + Send + 'static>)>) {
+    if watches.is_empty() {
+        return;
+    }
     std::thread::Builder::new()
         .name("maind-log".into())
-        .spawn(move || {
-            use std::io::{BufRead, BufReader, Seek, SeekFrom};
-            let mut cur: Option<(u64, BufReader<std::fs::File>)> = None;
-            let mut first = true;
-            let mut part = String::new();
-            loop {
-                std::thread::sleep(Duration::from_millis(150));
-                let Ok(st) = std::fs::metadata(path) else { continue };
-                let ino = inode(&st);
-                if cur.as_ref().is_none_or(|(i, _)| *i != ino) {
-                    let Ok(mut f) = std::fs::File::open(path) else { continue };
-                    if first {
-                        let _ = f.seek(SeekFrom::End(0)); // старые активации не переигрываем
-                        first = false;
-                    }
-                    part.clear();
-                    cur = Some((ino, BufReader::with_capacity(8192, f)));
+        .stack_size(128 * 1024)
+        .spawn(move || follow_logs_loop(watches))
+        .expect("поток журнала maind");
+}
+
+#[cfg(target_os = "linux")]
+fn follow_logs_loop(watches: Vec<(&'static str, Box<dyn Fn(&str) + Send + 'static>)>) {
+    use std::ffi::CString;
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+    struct Item {
+        path: &'static str,
+        dir: Option<CString>,
+        file_cstr: Option<CString>,
+        on_line: Box<dyn Fn(&str) + Send + 'static>,
+        cur: Option<(u64, BufReader<std::fs::File>)>,
+        first: bool,
+        part: String,
+        dir_wd: i32,
+        file_wd: i32,
+    }
+
+    let ifd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    let mut items: Vec<Item> = watches
+        .into_iter()
+        .map(|(path, on_line)| {
+            let p = std::path::Path::new(path);
+            let dir = p
+                .parent()
+                .and_then(|d| d.to_str())
+                .and_then(|s| CString::new(s).ok());
+            let file_cstr = CString::new(path).ok();
+            Item {
+                path,
+                dir,
+                file_cstr,
+                on_line,
+                cur: None,
+                first: true,
+                part: String::new(),
+                dir_wd: -1,
+                file_wd: -1,
+            }
+        })
+        .collect();
+    let mut ev_buf = [0u8; 2048];
+    loop {
+        let mut need_poll_fallback = ifd < 0;
+        for it in &mut items {
+            if ifd >= 0 && it.dir_wd < 0
+                && let Some(dir) = &it.dir
+            {
+                let wd = unsafe {
+                    libc::inotify_add_watch(
+                        ifd,
+                        dir.as_ptr(),
+                        libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_MOVED_FROM | libc::IN_DELETE,
+                    )
+                };
+                if wd >= 0 {
+                    it.dir_wd = wd;
+                } else {
+                    need_poll_fallback = true;
                 }
-                let (_, rd) = cur.as_mut().unwrap();
+            }
+            let Ok(st) = std::fs::metadata(it.path) else {
+                if it.file_wd >= 0 && ifd >= 0 {
+                    unsafe { libc::inotify_rm_watch(ifd, it.file_wd) };
+                    it.file_wd = -1;
+                }
+                it.cur = None;
+                continue;
+            };
+            let ino = inode(&st);
+            if it.cur.as_ref().is_none_or(|(i, _)| *i != ino) {
+                if let Ok(mut f) = std::fs::File::open(it.path) {
+                    if it.first {
+                        let _ = f.seek(SeekFrom::End(0)); // старые активации не переигрываем
+                        it.first = false;
+                    }
+                    it.part.clear();
+                    it.cur = Some((ino, BufReader::with_capacity(8192, f)));
+                    if ifd >= 0 {
+                        if it.file_wd >= 0 {
+                            unsafe { libc::inotify_rm_watch(ifd, it.file_wd) };
+                            it.file_wd = -1;
+                        }
+                        if let Some(fc) = &it.file_cstr {
+                            let wd = unsafe {
+                                libc::inotify_add_watch(
+                                    ifd,
+                                    fc.as_ptr(),
+                                    libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF,
+                                )
+                            };
+                            if wd >= 0 {
+                                it.file_wd = wd;
+                            }
+                        }
+                    }
+                }
+            }
+            if it.cur.is_some() && it.file_wd < 0 {
+                need_poll_fallback = true;
+            }
+            if let Some((_, rd)) = it.cur.as_mut() {
                 loop {
-                    match rd.read_line(&mut part) {
+                    match rd.read_line(&mut it.part) {
                         Ok(0) | Err(_) => break,
-                        Ok(_) if part.ends_with('\n') => {
-                            on_line(&part);
-                            part.clear();
+                        Ok(_) if it.part.ends_with('\n') => {
+                            (it.on_line)(&it.part);
+                            it.part.clear();
                         }
                         Ok(_) => {} // строка ещё дописывается — ждём продолжения
                     }
                 }
             }
+        }
+        if ifd < 0 {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        let timeout_ms = if need_poll_fallback { 1000 } else { -1 };
+        let mut pfd = libc::pollfd {
+            fd: ifd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc > 0 {
+            while unsafe { libc::read(ifd, ev_buf.as_mut_ptr().cast(), ev_buf.len()) } > 0 {}
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn follow_logs_loop(watches: Vec<(&'static str, Box<dyn Fn(&str) + Send + 'static>)>) {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    struct Item {
+        path: &'static str,
+        on_line: Box<dyn Fn(&str) + Send + 'static>,
+        cur: Option<(u64, BufReader<std::fs::File>)>,
+        first: bool,
+        part: String,
+    }
+    let mut items: Vec<Item> = watches
+        .into_iter()
+        .map(|(path, on_line)| Item {
+            path,
+            on_line,
+            cur: None,
+            first: true,
+            part: String::new(),
         })
-        .expect("поток журнала maind");
+        .collect();
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        for it in &mut items {
+            let Ok(st) = std::fs::metadata(it.path) else { continue };
+            let ino = inode(&st);
+            if it.cur.as_ref().is_none_or(|(i, _)| *i != ino) {
+                let Ok(mut f) = std::fs::File::open(it.path) else { continue };
+                if it.first {
+                    let _ = f.seek(SeekFrom::End(0));
+                    it.first = false;
+                }
+                it.part.clear();
+                it.cur = Some((ino, BufReader::with_capacity(8192, f)));
+            }
+            let (_, rd) = it.cur.as_mut().unwrap();
+            loop {
+                match rd.read_line(&mut it.part) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if it.part.ends_with('\n') => {
+                        (it.on_line)(&it.part);
+                        it.part.clear();
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+    }
 }
 
 #[cfg(unix)]

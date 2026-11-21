@@ -31,11 +31,17 @@ pub fn embed_ui(app: &str, override_var: &str, compress: Option<fn(&[u8]) -> Vec
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let embedded = if let Some(compress) = compress {
-            let dst = out_dir.join("ui").join(format!("{name}.gz"));
-            fs::create_dir_all(dst.parent().unwrap()).unwrap();
-            fs::write(&dst, compress(&fs::read(&path).unwrap())).unwrap();
-            dst
+        let embedded = if let Some(compress) = compress.filter(|_| should_gzip(&name)) {
+            let raw = fs::read(&path).unwrap();
+            let gz = compress(&raw);
+            if gz.len() < raw.len() {
+                let dst = out_dir.join("ui").join(format!("{name}.gz"));
+                fs::create_dir_all(dst.parent().unwrap()).unwrap();
+                fs::write(&dst, gz).unwrap();
+                dst
+            } else {
+                path
+            }
         } else {
             path
         };
@@ -46,6 +52,14 @@ pub fn embed_ui(app: &str, override_var: &str, compress: Option<fn(&[u8]) -> Vec
     }
     table.push_str("];\n");
     fs::write(out_dir.join("ui_files.rs"), table).unwrap();
+}
+
+fn should_gzip(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("");
+    !matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "woff2" | "png" | "jpg" | "jpeg" | "webp" | "ico"
+    )
 }
 
 fn collect_files(dir: &Path, assets: &mut Vec<PathBuf>) {

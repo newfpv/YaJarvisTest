@@ -140,7 +140,13 @@ fn main() {
         }
     };
     jlog::set_timezone(&store.with(|s| s.timezone.clone()));
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(8)
+        .thread_stack_size(512 * 1024)
+        .enable_all()
+        .build()
+        .expect("tokio");
     rt.block_on(run(f, store));
 }
 
@@ -192,7 +198,7 @@ async fn run(f: Flags, store: settings::Store) {
                 Box::new(move |text| {
                     // плагин просит сказать вслух (напоминание, ответ на событие): голосом ассистента
                     if let Some(e) = cell.get().and_then(std::sync::Weak::upgrade) {
-                        std::thread::spawn(move || e.say_text(&text));
+                        let _ = std::thread::Builder::new().name("say".into()).stack_size(512 * 1024).spawn(move || e.say_text(&text));
                     }
                 })
             },
@@ -258,7 +264,7 @@ async fn run(f: Flags, store: settings::Store) {
     // микрофон и слово «Джарвис»
     let mic = {
         let st = store.clone();
-        audio::Mic::new(f.mic.clone(), Box::new(move || st.with(|s| s.mic_gain_db)))
+        audio::Mic::new(f.mic.clone(), Box::new(move || st.mic_gain_db()))
     };
     if cfg!(unix) {
         mic.clone().run();
@@ -268,17 +274,17 @@ async fn run(f: Flags, store: settings::Store) {
     let (listener, det) = wake::Listener::new(&f.data, &store, host.wake_training());
     let player = {
         let st = store.clone();
-        audio::Player::new(Box::new(move || st.with(|s| s.voice_volume())), Box::new(|| speakervol::voice_trim(speakervol::speaker_level())))
+        audio::Player::new(Box::new(move || st.voice_volume()), Box::new(|| speakervol::voice_trim(speakervol::speaker_level())))
     };
     let leds = {
         let st = store.clone();
-        led::Leds::new(Box::new(move || st.with(|s| s.led_for())))
+        led::Leds::new(Box::new(move || st.led_for()))
     };
     tokio::spawn(chatgpt::warm_loop(host.clone(), store.clone()));
     let journal = Arc::new(journal::Journal::default());
     let memory = {
         let (a, b) = (store.clone(), store.clone());
-        memory::Memory::load(f.data.join("chatgpt-chat.json"), Box::new(move || !a.with(|s| s.memory.off)), Box::new(move || b.with(|s| s.now())))
+        memory::Memory::load(f.data.join("chatgpt-chat.json"), Box::new(move || !a.with(|s| s.memory.off)), Box::new(move || b.now()))
     };
     {
         let m = memory.clone();

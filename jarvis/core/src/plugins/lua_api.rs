@@ -7,6 +7,9 @@ pub struct Timer {
     function: Function,
 }
 pub type Timers = Arc<Mutex<BTreeMap<u64, Timer>>>;
+pub fn next_at(timers: &Timers) -> Option<Instant> {
+    timers.lock().unwrap().values().map(|t| t.at).min()
+}
 pub fn due(timers: &Timers) -> Vec<(u64, Function)> {
     let mut timers = timers.lock().unwrap();
     let now = Instant::now();
@@ -223,6 +226,7 @@ pub fn install(
     if m.permissions.iter().any(|p| p == "network") {
         let allowed = m.network_allow.clone();
         let stop = stopped.clone();
+        let cached_client: Arc<Mutex<Option<(Value, reqwest::Client)>>> = Arc::new(Mutex::new(None));
         api.set("fetch",lua.create_function(move |lua,(url,options):(String,Option<Table>)|{
             let started=Instant::now();let until=*wall.lock().unwrap();
             let mut url=reqwest::Url::parse(&url).map_err(|_|fail("неверный URL"))?;
@@ -255,9 +259,12 @@ pub fn install(
             if !matches!(resp_enc,"utf8"|"base64"){return Err(fail("неверный response_encoding"));}
             let headers: BTreeMap<String,String>=options.get("headers").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose().map_err(fail)?.unwrap_or_default();
             let route=(host.upgrade().ok_or_else(||fail("хост завершился"))?.hooks.network)();
-            let result=runtime.block_on(async {
-                let operation=async {
-                    if let Some(error)=route["error"].as_str(){return Err(fail(error));}
+            if let Some(error)=route["error"].as_str(){return Err(fail(error));}
+            let client = {
+                let mut g = cached_client.lock().unwrap();
+                if let Some((prev, client)) = &*g && *prev == route {
+                    client.clone()
+                } else {
                     let mut builder=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(8)).timeout(Duration::from_secs(25));
                     if let Some(socks)=route["socks"].as_str() {
                         let address:std::net::SocketAddr=socks.parse().map_err(|_|fail("неверный SOCKS VPN"))?;
@@ -265,6 +272,12 @@ pub fn install(
                         builder=builder.proxy(reqwest::Proxy::all(format!("socks5h://{socks}")).map_err(fail)?.basic_auth(route["user"].as_str().unwrap_or(""),route["pass"].as_str().unwrap_or("")));
                     }
                     let client=builder.build().map_err(fail)?;
+                    *g = Some((route.clone(), client.clone()));
+                    client
+                }
+            };
+            let result=runtime.block_on(async {
+                let operation=async {
                     for redirect in 0..=5 {
                         if !permitted(&url,&allowed){return Err(fail("переход на запрещённый домен"));}
                         let mut request=client.request(method.clone(),url.clone()).body(raw_body.clone());

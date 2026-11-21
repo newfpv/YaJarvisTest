@@ -45,13 +45,16 @@ pub async fn volume(body: axum::body::Bytes) -> Response {
 }
 
 pub async fn journal(State(app): State<App>) -> Response {
-    let vol = tokio::task::spawn_blocking(super::vol).await.unwrap_or(-1);
+    let (vol, sys) = tokio::join!(
+        async { tokio::task::spawn_blocking(super::vol).await.unwrap_or(-1) },
+        app.telemetry.live_system(),
+    );
     let e = &app.engine;
     let talking = e.talking();
     let phase = if talking { e.leds.phase().name() } else { "" };
     reply(
         StatusCode::OK,
         json!({"items": e.journal.items(50), "mic": e.mic.online(), "mic_why": "", "talking": talking, "phase": phase,
-               "sys": app.telemetry.system(), "volume": vol, "version": crate::version()}),
+               "sys": sys, "volume": vol, "version": crate::version()}),
     )
 }

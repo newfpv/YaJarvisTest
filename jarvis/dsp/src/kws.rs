@@ -27,26 +27,27 @@ struct Conv {
     cout: usize,
     k: usize,
     dil: usize,
-    w: Vec<f32>, // [cout][cin][k]
+    w: Vec<f32>, // [cout][k][cin] — соседние каналы подряд для векторизации dot()
     b: Vec<f32>,
-    hist: Vec<Vec<f32>>, // кольцо входов длиной (k-1)·dil+1
+    span: usize,
+    hist: Vec<f32>, // плоское кольцо длиной span * cin
     pos: usize,
 }
 
 impl Conv {
     fn step(&mut self, x: &[f32], out: &mut [f32]) {
-        let span = (self.k - 1) * self.dil + 1;
-        self.hist[self.pos].copy_from_slice(x);
+        let span = self.span;
+        let cin = self.cin;
+        self.hist[self.pos * cin..(self.pos + 1) * cin].copy_from_slice(x);
         for o in 0..self.cout {
             let mut acc = self.b[o];
-            let wo = &self.w[o * self.cin * self.k..];
+            let wo = &self.w[o * self.k * cin..];
             for t in 0..self.k {
                 // t=k-1 — текущий кадр, t=0 — самый старый
-                let idx = (self.pos as isize - ((self.k - 1 - t) * self.dil) as isize).rem_euclid(span as isize) as usize;
-                let inp = &self.hist[idx];
-                for c in 0..self.cin {
-                    acc += wo[c * self.k + t] * inp[c];
-                }
+                let lag = (self.k - 1 - t) * self.dil;
+                let idx = (self.pos + span - lag) % span;
+                let inp = &self.hist[idx * cin..(idx + 1) * cin];
+                acc += crate::dot(&wo[t * cin..(t + 1) * cin], inp);
             }
             out[o] = acc;
         }
@@ -54,9 +55,7 @@ impl Conv {
     }
 
     fn reset(&mut self) {
-        for h in &mut self.hist {
-            h.fill(0.0);
-        }
+        self.hist.fill(0.0);
         self.pos = 0;
     }
 }
@@ -65,17 +64,17 @@ pub struct Kws {
     pub h: Header,
     mean: Vec<f32>,
     std: Vec<f32>,
-    mel: Vec<Vec<f32>>,
-    window: Vec<f64>,
+    mel_sparse: Vec<(usize, Vec<f32>)>,
+    window: Vec<f32>,
     proj: Conv,
     blocks: Vec<Conv>,
     head: Conv,
-    buf: Vec<f64>,
+    buf: Vec<f32>,
     feat: Vec<f32>,
     a: Vec<f32>,
     b2: Vec<f32>,
-    re: Vec<f64>,
-    im: Vec<f64>,
+    fft: crate::Rfft,
+    frame_buf: Vec<f32>,
     power: Vec<f32>,
     smooth: [f32; 3],
     si: usize,
@@ -158,10 +157,18 @@ impl Kws {
         let std = take(h.n_mels)?;
         if std.iter().any(|v|*v<=0.0){return Err("wake.bin: неверная нормализация".into());}
         let mut mk = |cin: usize, cout: usize, k: usize, dil: usize| -> Result<Conv, String> {
-            let w = take(cout * cin * k)?;
+            let raw_w = take(cout * cin * k)?;
+            let mut w = vec![0.0; raw_w.len()];
+            for o in 0..cout {
+                for t in 0..k {
+                    for c in 0..cin {
+                        w[(o * k + t) * cin + c] = raw_w[(o * cin + c) * k + t];
+                    }
+                }
+            }
             let b = take(cout)?;
             let span = (k - 1) * dil + 1;
-            Ok(Conv { cin, cout, k, dil, w, b, hist: vec![vec![0.0; cin]; span], pos: 0 })
+            Ok(Conv { cin, cout, k, dil, w, b, span, hist: vec![0.0; span * cin], pos: 0 })
         };
         let proj = mk(h.n_mels, h.channels, 1, 1)?;
         let mut blocks = vec![];
@@ -176,10 +183,20 @@ impl Kws {
             return Err("wake.bin: нужно 10 порогов".into());
         }
         // окно Ханна, как torch.hann_window(periodic=True)
-        let window = (0..h.win).map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / h.win as f64).cos()).collect();
+        let window = (0..h.win)
+            .map(|i| (0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / h.win as f64).cos()) as f32)
+            .collect();
         let bins = h.n_fft / 2 + 1;
+        let mel_sparse = mel_bank(h.sample_rate, h.n_fft, h.n_mels, h.fmin, h.fmax)
+            .into_iter()
+            .map(|row| {
+                let first = row.iter().position(|&v| v != 0.0).unwrap_or(0);
+                let last = row.iter().rposition(|&v| v != 0.0).map_or(first, |i| i + 1);
+                (first, row[first..last].to_vec())
+            })
+            .collect();
         Ok(Kws {
-            mel: mel_bank(h.sample_rate, h.n_fft, h.n_mels, h.fmin, h.fmax),
+            mel_sparse,
             mean,
             std,
             window,
@@ -190,8 +207,8 @@ impl Kws {
             feat: vec![0.0; h.n_mels],
             a: vec![0.0; h.channels],
             b2: vec![0.0; h.channels],
-            re: vec![0.0; h.n_fft],
-            im: vec![0.0; h.n_fft],
+            fft: crate::Rfft::new(h.n_fft),
+            frame_buf: vec![0.0; h.n_fft],
             power: vec![0.0; bins],
             smooth: [0.0; 3],
             si: 0,
@@ -204,23 +221,16 @@ impl Kws {
 
     /// Один кадр (окно win): обновить сеть; вернуть сглаженную вероятность.
     pub fn frame(&mut self, x: &[f64]) -> f32 {
-        let bins = self.h.n_fft / 2 + 1;
-        self.re.fill(0.0);
-        self.im.fill(0.0);
-        for (i, v) in x.iter().enumerate() {
-            self.re[i] = v * self.window[i];
+        for (dst, (&v, &w)) in self.frame_buf[..self.h.win].iter_mut().zip(x.iter().zip(&self.window)) {
+            *dst = v as f32 * w;
         }
-        crate::fft(&mut self.re, &mut self.im);
-        for b in 0..bins {
-            self.power[b] = (self.re[b] * self.re[b] + self.im[b] * self.im[b]) as f32;
-        }
-        for (m, f) in self.mel.iter().enumerate() {
-            let mut acc = 0f32;
-            for (b, &w) in f.iter().enumerate() {
-                if w != 0.0 {
-                    acc += w * self.power[b];
-                }
-            }
+        self.frame_loaded()
+    }
+
+    fn frame_loaded(&mut self) -> f32 {
+        self.fft.power(&self.frame_buf, &mut self.power);
+        for (m, (start, weights)) in self.mel_sparse.iter().enumerate() {
+            let acc = crate::dot(weights, &self.power[*start..*start + weights.len()]);
             self.feat[m] = (((acc as f64) + 1e-6).ln() as f32 - self.mean[m]) / self.std[m];
         }
         self.proj.step(&self.feat, &mut self.a);
@@ -249,13 +259,18 @@ impl Kws {
 
 impl crate::Wake for Kws {
     fn feed(&mut self, pcm: &[i16]) -> bool {
-        self.buf.extend(pcm.iter().map(|&s| s as f64 / 32768.0));
+        self.buf.extend(pcm.iter().map(|&s| s as f32 / 32768.0));
         let mut hit = false;
         let mut off = 0;
         let (win, hop) = (self.h.win, self.h.hop);
         while self.buf.len() - off >= win {
-            let frame: Vec<f64> = self.buf[off..off + win].to_vec();
-            let avg = self.frame(&frame);
+            for (dst, (&x, &w)) in self.frame_buf[..win]
+                .iter_mut()
+                .zip(self.buf[off..off + win].iter().zip(&self.window))
+            {
+                *dst = x * w;
+            }
+            let avg = self.frame_loaded();
             off += hop;
             if self.cooldown > 0 {
                 self.cooldown -= 1;
@@ -267,7 +282,11 @@ impl crate::Wake for Kws {
                 hit = true;
             }
         }
-        self.buf.drain(..off);
+        let rem = self.buf.len() - off;
+        if off > 0 {
+            self.buf.copy_within(off.., 0);
+            self.buf.truncate(rem);
+        }
         hit
     }
 

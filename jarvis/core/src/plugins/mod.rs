@@ -19,7 +19,10 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -412,6 +415,7 @@ pub struct Host {
     pub inner: Mutex<Inner>,
     install_lock: tokio::sync::Mutex<()>,
     pub catalog: catalog::Cache,
+    wake_training_cached: AtomicBool,
 }
 
 pub fn arch() -> &'static str {
@@ -452,7 +456,21 @@ impl Host {
             inner: Mutex::default(),
             install_lock: tokio::sync::Mutex::new(()),
             catalog: catalog::Cache::default(),
+            wake_training_cached: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn sync_wake_training(&self, g: &Inner) {
+        let on = g.state.get("training").is_some_and(|s| s.enabled)
+            && g.plugins.get("training").is_some_and(|p| {
+                p.manifest.provides("training") && p.rt.as_ref().is_some_and(Runtime::is_service)
+            });
+        self.wake_training_cached.store(on, Ordering::Release);
+    }
+
+    pub(crate) fn refresh_wake_training(&self) {
+        let g = self.inner.lock().unwrap();
+        self.sync_wake_training(&g);
     }
 
     pub fn dir(&self) -> PathBuf {
@@ -540,6 +558,7 @@ impl Host {
                 }
             }
             self.save(&g);
+            self.sync_wake_training(&g);
         }
         for id in to_start {
             self.start(&id).await;
@@ -600,17 +619,28 @@ impl Host {
                 p.err = e;
             }
         }
+        self.sync_wake_training(&g);
     }
 
     pub async fn stop(&self, id: &str) {
-        let rt = self.inner.lock().unwrap().plugins.get_mut(id).and_then(|p| p.rt.take());
+        let rt = {
+            let mut g = self.inner.lock().unwrap();
+            let rt = g.plugins.get_mut(id).and_then(|p| p.rt.take());
+            self.sync_wake_training(&g);
+            rt
+        };
         if let Some(rt) = rt {
             rt.stop().await;
         }
     }
 
     pub async fn stop_all(&self) {
-        let rts: Vec<Runtime> = self.inner.lock().unwrap().plugins.values_mut().filter_map(|p| p.rt.take()).collect();
+        let rts: Vec<Runtime> = {
+            let mut g = self.inner.lock().unwrap();
+            let rts = g.plugins.values_mut().filter_map(|p| p.rt.take()).collect();
+            self.sync_wake_training(&g);
+            rts
+        };
         for rt in rts {
             rt.stop().await;
         }
@@ -622,11 +652,7 @@ impl Host {
     }
 
     pub fn wake_training(&self) -> bool {
-        let g = self.inner.lock().unwrap();
-        g.state.get("training").is_some_and(|s| s.enabled)
-            && g.plugins.get("training").is_some_and(|p| {
-                p.manifest.provides("training") && p.rt.as_ref().is_some_and(Runtime::is_service)
-            })
+        self.wake_training_cached.load(Ordering::Acquire)
     }
 
     pub fn supports_chat(&self, id: &str) -> bool {
@@ -831,6 +857,7 @@ impl Host {
             let was = st.enabled;
             st.enabled = on;
             self.save(&g);
+            self.sync_wake_training(&g);
             was
         };
         if on && !was {
@@ -889,6 +916,7 @@ impl Host {
             }
         }
         self.save(&g);
+        self.sync_wake_training(&g);
         log::info!("плагины: удалён {id}");
         Ok(())
     }

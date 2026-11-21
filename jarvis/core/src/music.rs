@@ -25,6 +25,7 @@ pub struct Music {
     pub alice: Mutex<AliceMusic>,
     button: Mutex<Button>,
     cancel: tokio::sync::watch::Sender<u64>,
+    playing_tx: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -39,11 +40,25 @@ impl Default for Music {
             alice: Mutex::default(),
             button: Mutex::default(),
             cancel: tokio::sync::watch::channel(0).0,
+            playing_tx: tokio::sync::watch::channel(false).0,
         }
     }
 }
 
 impl Music {
+    fn set_remote(&self, next: Remote) {
+        let playing = next.playing;
+        *self.state.lock().unwrap() = next;
+        let _ = self.playing_tx.send_if_modified(|cur| {
+            if *cur == playing {
+                false
+            } else {
+                *cur = playing;
+                true
+            }
+        });
+    }
+
     pub fn state(&self) -> Remote {
         self.state.lock().unwrap().clone()
     }
@@ -117,12 +132,12 @@ impl Music {
         match name {
             "music.state" => {
                 if let Ok(st) = serde_json::from_value(data) {
-                    *self.state.lock().unwrap() = st;
+                    self.set_remote(st);
                 }
             }
             "exit" => {
                 self.cancel.send_modify(|n| *n = n.wrapping_add(1));
-                *self.state.lock().unwrap() = Remote::default();
+                self.set_remote(Remote::default());
             }
             _ => {}
         }
@@ -178,7 +193,7 @@ impl Music {
         if let Some(st) = out.get("state").filter(|v| !v.is_null()) {
             let st =
                 serde_json::from_value(st.clone()).map_err(|e| format!("состояние музыки: {e}"))?;
-            *self.state.lock().unwrap() = st;
+            self.set_remote(st);
         }
         if let Some(err) = out
             .get("error")
@@ -443,22 +458,23 @@ fn amount(w: &str) -> Option<f64> {
 
 pub fn volume_loop(music: Arc<Music>, host: Arc<Host>, duck: impl Fn() -> bool + Send + 'static) {
     tokio::spawn(async move {
+        let mut rx = music.playing_tx.subscribe();
         let mut last = -1.0;
         loop {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if !music.state().playing {
+            while !*rx.borrow_and_update() {
                 last = -1.0;
-                continue;
-            }
-            let v = if duck() { 0.16 } else { 0.8 };
-            if v == last {
-                continue;
-            }
-            if let Ok(n) = host.provider("youtube") {
-                if n.notify("volume", json!({"v":v})).await.is_ok() {
-                    last = v;
+                if rx.changed().await.is_err() {
+                    return;
                 }
             }
+            let v = if duck() { 0.16 } else { 0.8 };
+            if v != last
+                && let Ok(n) = host.provider("youtube")
+                && n.notify("volume", json!({"v": v})).await.is_ok()
+            {
+                last = v;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });
 }

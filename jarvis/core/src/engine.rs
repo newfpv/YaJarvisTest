@@ -16,6 +16,7 @@ use crate::{
 };
 use jarvis_dsp::Wake;
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -41,7 +42,7 @@ struct St {
     holding: bool,   // разговора с моделью ещё нет — звук с момента слова копится в hold
     hold: Vec<i16>,  // уйдёт модели целиком, когда разговор откроется
     aborted: bool,   // «Стоп» или «Алиса», пока разговор ещё не открыт
-    ring: Vec<i16>,  // последние ~3 с микрофона: само слово и начало фразы
+    ring: VecDeque<i16>,  // последние ~3 с микрофона: само слово и начало фразы
     last_wake: Option<Instant>,
     last_loud: Option<Instant>,
     pending_wake: bool,
@@ -103,8 +104,10 @@ pub struct Engine {
     st: Mutex<St>,
     reset_wake: AtomicBool,
     recording_word: AtomicBool,
+    training_active: AtomicBool,
     training_until: Mutex<Option<Instant>>,
     speech_epoch: AtomicU64,
+    speech_notify: tokio::sync::Notify,
     saying: AtomicBool,
     previews: voice_preview::Previews,
     wake_reply_sequence: AtomicU64,
@@ -298,6 +301,7 @@ impl Engine {
     }
 
     pub fn set_background_training(&self, minutes: Option<u32>) {
+        self.training_active.store(minutes.is_some(), Ordering::Release);
         *self.training_until.lock().unwrap() = minutes.map(|mins| Instant::now() + Duration::from_secs(u64::from(mins) * 60 + 1));
     }
     #[allow(clippy::too_many_arguments)]
@@ -315,8 +319,8 @@ impl Engine {
         music: Arc<crate::music::Music>,
     ) -> Arc<Engine> {
         Arc::new(Engine { store, host, mic, player, leds, journal, tools, music, listener, data, rt, st: Mutex::default(), reset_wake: AtomicBool::new(false),
-            recording_word: AtomicBool::new(false), training_until: Mutex::new(None),
-            speech_epoch: AtomicU64::new(0), saying: AtomicBool::new(false), previews: Default::default(),
+            recording_word: AtomicBool::new(false), training_active: AtomicBool::new(false), training_until: Mutex::new(None),
+            speech_epoch: AtomicU64::new(0), speech_notify: tokio::sync::Notify::new(), saying: AtomicBool::new(false), previews: Default::default(),
             wake_reply_sequence: AtomicU64::new(0), cmds: Default::default() })
     }
 
@@ -338,6 +342,7 @@ impl Engine {
         let training = crate::training_io::AudioBatch::channel(&self.rt, self.host.clone());
         std::thread::Builder::new()
             .name("engine".into())
+            .stack_size(512 * 1024)
             .spawn(move || {
                 let (_, rx) = e.mic.subscribe(256);
                 let mut batch = crate::training_io::AudioBatch::default();
@@ -347,12 +352,19 @@ impl Engine {
                     if let Some(replacement)=e.listener.take_reload(&e.data,&e.store,training_enabled){det=replacement;}
                     let (live, busy, muted_input, input) = {
                         let mut st = e.st.lock().unwrap();
-                        // последние 3 с; буфер растёт до 6 с и сдвигается на месте — без лишних копий
-                        if st.ring.len() + raw.len() > 6 * RATE {
-                            let from = st.ring.len().saturating_sub(3 * RATE);
-                            st.ring.drain(..from);
+                        if st.ring.capacity() < 3 * RATE + RATE / 25 {
+                            st.ring.reserve(3 * RATE + RATE / 25);
                         }
-                        st.ring.extend_from_slice(&raw);
+                        if raw.len() >= 3 * RATE {
+                            st.ring.clear();
+                            st.ring.extend(&raw[raw.len() - 3 * RATE..]);
+                        } else {
+                            let overflow = (st.ring.len() + raw.len()).saturating_sub(3 * RATE);
+                            if overflow > 0 {
+                                st.ring.drain(..overflow);
+                            }
+                            st.ring.extend(&raw[..]);
+                        }
                         if loud(&raw) {
                             st.last_loud = Some(Instant::now());
                         }
@@ -389,17 +401,29 @@ impl Engine {
                     if e.reset_wake.swap(false, Ordering::Relaxed) {
                         det.reset();
                     }
-                    let (enabled, boost_db) = e.store.with(|s| (s.wake_enabled, s.mic_boost_db));
+                    let enabled = e.store.wake_enabled() && !e.recording_word.load(Ordering::Acquire);
+                    let boost_db = e.store.mic_boost_db();
                     let ready = e.listener.ready.load(Ordering::Relaxed);
-                    let enabled = enabled && !e.recording_word.load(Ordering::Acquire);
                     let hit = ready && enabled && det.feed(&raw); // поток признаков непрерывный, и во время разговора
                     let prob = det.last_prob();
                     e.listener.last_prob.store(prob.to_bits(), Ordering::Relaxed);
                     if training_enabled {
-                        let (collect, limit) = e.store.with(|s| (s.train_mode, s.train_limit_mb));
-                        let collect = collect && e.listener.phrase() == crate::wake_profiles::DEFAULT_PHRASE;
-                        let background = e.training_until.lock().unwrap().is_some_and(|until| until > Instant::now());
+                        let collect = e.store.train_mode() && e.listener.is_default_phrase();
+                        let background = if e.training_active.load(Ordering::Relaxed) {
+                            let mut until = e.training_until.lock().unwrap();
+                            match *until {
+                                Some(t) if t > Instant::now() => true,
+                                _ => {
+                                    *until = None;
+                                    e.training_active.store(false, Ordering::Release);
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
                         if collect || background {
+                            let limit = e.store.train_limit_mb();
                             let discard = busy || live.is_some() || e.saying.load(Ordering::Relaxed) || e.player.playing() || !ready || !enabled;
                             if let Some(frame) = batch.push(&raw, hit, discard, prob, collect, limit) {
                                 let _ = training.try_send(frame);
@@ -413,7 +437,12 @@ impl Engine {
                     if let Some(live) = live {
                         if muted_input {
                             // Preserve the input clock for the provider's turn detector.
-                            live.feed(&vec![0; raw.len()]);
+                            static ZERO: [i16; 320] = [0; 320];
+                            if raw.len() <= ZERO.len() {
+                                live.feed(&ZERO[..raw.len()]);
+                            } else {
+                                live.feed(&vec![0; raw.len()]);
+                            }
                         } else if boost_db > 0 {
                             live.feed(&boost(&input, boost_db));
                         } else {
@@ -525,7 +554,7 @@ impl Engine {
             st.aborted = false;
             st.hold.clear();
             st.holding = true;
-            st.ring[st.ring.len().saturating_sub(3 * RATE)..].to_vec()
+            st.ring.make_contiguous().to_vec()
         };
         let by_word = source == "слово";
         // как у Алисы: услышал слово — сразу кольцо и разговор; проверка имени расшифровкой — по галочке
@@ -542,16 +571,37 @@ impl Engine {
         let e = self.clone();
         std::thread::Builder::new()
             .name("converse".into())
+            .stack_size(512 * 1024)
             .spawn(move || {
-                let preroll = if by_word { clip.clone() } else { vec![] };
-                // сбой внутри разговора не должен оставить Джарвиса «занятым» навсегда
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.converse(by_word, sure, preroll, clip))).is_err() {
-                    log::info!("Джарвис: разговор оборвался из-за ошибки ядра");
-                    e.player.stop(true);
-                    if let Some(l) = e.st.lock().unwrap_or_else(|p| p.into_inner()).live.take() {
-                        l.close();
+                struct ConverseGuard<'a> {
+                    engine: &'a Engine,
+                    completed: bool,
+                }
+                impl Drop for ConverseGuard<'_> {
+                    fn drop(&mut self) {
+                        if !self.completed {
+                            self.engine.player.stop(true);
+                            if let Some(l) = self.engine.st.lock().unwrap_or_else(|p| p.into_inner()).live.take() {
+                                l.close();
+                            }
+                            let mut st = self.engine.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.pending_wake = false;
+                            st.busy = false;
+                            st.live = None;
+                            st.aborted = false;
+                            st.hold.clear();
+                            st.holding = false;
+                            st.echo = EchoWindow::default();
+                            st.wake_echo = None;
+                            self.engine.reset_wake.store(true, Ordering::Relaxed);
+                            self.engine.leds.set(Mode::Off);
+                        }
                     }
                 }
+                let mut guard = ConverseGuard { engine: &e, completed: false };
+                let preroll = if by_word { clip.clone() } else { vec![] };
+                guard.engine.converse(by_word, sure, preroll, clip);
+                guard.completed = true;
                 let queued = {
                     let mut st = e.st.lock().unwrap();
                     let q = st.pending_wake;
@@ -1137,6 +1187,7 @@ impl Engine {
     /// Закончить только разговор: музыка, если играет, играет дальше. Блокирует до 3 с.
     pub fn end_chat(&self, reason: &str) {
         self.speech_epoch.fetch_add(1, Ordering::SeqCst);
+        self.speech_notify.notify_waiters();
         let sess = {
             let mut st = self.st.lock().unwrap();
             let sess = st.live.take();
@@ -1157,32 +1208,34 @@ impl Engine {
 
     /// Журнал maind: штатный споттер «Алиса» — Джарвис уступает.
     fn watch_alice(self: &Arc<Self>) {
-        let w = Arc::downgrade(self);
-        alice::follow_log(alice::MAIND_LOG, move |line| {
-            let Some(e) = w.upgrade() else { return };
-            if line.contains("onPhraseSpotted") && line.contains("alice_capability") && e.talking() {
-                e.end_chat("позвали Алису");
-                let _ = e.rt.block_on(e.music.call(&e.host, "stop", serde_json::Value::Null));
-            }
-            if line.contains("Toggle play/pause") {
-                e.rt.block_on(e.music.pause_button(&e.host));
-            }
-            let (started, id) = e.music.alice.lock().unwrap().main_log(line);
-            if started || id.is_some() {
-                e.rt.clone().spawn(async move {
-                    if started { e.music.alice_started(&e.host).await; }
-                    if let Some(id) = id && let Some(track) = crate::alice_music::lookup(&id).await {
-                        e.music.alice.lock().unwrap().set_track(&id, track);
-                    }
-                });
-            }
-        });
-        let w = Arc::downgrade(self);
-        alice::follow_log("/data/quasar/daemons_logs/mediad.log", move |line| {
-            let Some(e) = w.upgrade() else { return };
-            let started = e.music.alice.lock().unwrap().media_log(line);
-            if started { e.rt.block_on(e.music.alice_started(&e.host)); }
-        });
+        let w1 = Arc::downgrade(self);
+        let w2 = Arc::downgrade(self);
+        alice::follow_logs(vec![
+            (alice::MAIND_LOG, Box::new(move |line| {
+                let Some(e) = w1.upgrade() else { return };
+                if line.contains("onPhraseSpotted") && line.contains("alice_capability") && e.talking() {
+                    e.end_chat("позвали Алису");
+                    let _ = e.rt.block_on(e.music.call(&e.host, "stop", serde_json::Value::Null));
+                }
+                if line.contains("Toggle play/pause") {
+                    e.rt.block_on(e.music.pause_button(&e.host));
+                }
+                let (started, id) = e.music.alice.lock().unwrap().main_log(line);
+                if started || id.is_some() {
+                    e.rt.clone().spawn(async move {
+                        if started { e.music.alice_started(&e.host).await; }
+                        if let Some(id) = id && let Some(track) = crate::alice_music::lookup(&id).await {
+                            e.music.alice.lock().unwrap().set_track(&id, track);
+                        }
+                    });
+                }
+            })),
+            ("/data/quasar/daemons_logs/mediad.log", Box::new(move |line| {
+                let Some(e) = w2.upgrade() else { return };
+                let started = e.music.alice.lock().unwrap().media_log(line);
+                if started { e.rt.block_on(e.music.alice_started(&e.host)); }
+            })),
+        ]);
     }
 }
 

@@ -173,7 +173,7 @@ impl Config {
             .find(|s| !s.is_empty())
             .unwrap()
             .to_string();
-        rustls::pki_types::ServerName::try_from(server_name.clone())
+        reality_tls::pki_types::ServerName::try_from(server_name.clone())
             .map_err(|_| "Неверный SNI VLESS")?;
         let insecure = match (get("allowInsecure"), get("insecure")) {
             ("1" | "true", "" | "1" | "true") | ("", "1" | "true") => true,

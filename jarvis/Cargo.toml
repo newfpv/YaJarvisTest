@@ -12,7 +12,7 @@ license = "MIT"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "fs", "process", "signal"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "io-util", "fs", "process", "signal"] }
 log = "0.4"
 
 # Колонка: 87 МБ флешки и 238 МБ памяти на всё. Собираем как можно компактнее.
@@ -23,6 +23,7 @@ codegen-units = 1
 strip = true
 debug = false
 incremental = false
+panic = "abort"
 
 # Звук и нейросети слова считаются 100 раз в секунду: тут скорость важнее размера (векторизация NEON).
 [profile.release.package.jarvis-dsp]

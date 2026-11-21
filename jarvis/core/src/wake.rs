@@ -46,7 +46,7 @@ fn load(data: &Path, store: &Store, training: bool) -> Loaded {
     }
     let sens = |store: &Store| {
         let s = store.clone();
-        Box::new(move || s.with(|s| s.wake_sensitivity)) as Box<dyn Fn() -> i64 + Send>
+        Box::new(move || s.wake_sensitivity()) as Box<dyn Fn() -> i64 + Send>
     };
     if !data.join("disable-oww").exists() {
         if let (Ok(feat), Ok(head)) = (std::fs::read(data.join("oww.bin")), std::fs::read(data.join("wake_oww.bin"))) {
@@ -114,20 +114,36 @@ pub struct Listener {
     pub last_prob: std::sync::atomic::AtomicU32,
     reload:std::sync::atomic::AtomicBool,
     training: std::sync::atomic::AtomicBool,
+    default_phrase: std::sync::atomic::AtomicBool,
     phrase: std::sync::RwLock<String>,
 }
 
 impl Listener {
     pub fn new(data: &Path, store: &Store, training: bool) -> (std::sync::Arc<Listener>, Box<dyn Wake>) {
         let w = load(data, store, training);
-        let me = std::sync::Arc::new(Listener { ready: w.ready.into(), last_prob: 0.into(),reload:false.into(),training:training.into(),phrase:w.phrase.into() });
+        let default_phrase = w.phrase == crate::wake_profiles::DEFAULT_PHRASE;
+        let me = std::sync::Arc::new(Listener {
+            ready: w.ready.into(),
+            last_prob: 0.into(),
+            reload: false.into(),
+            training: training.into(),
+            default_phrase: default_phrase.into(),
+            phrase: w.phrase.into(),
+        });
         (me, w.det)
     }
+    pub fn is_default_phrase(&self) -> bool { self.default_phrase.load(std::sync::atomic::Ordering::Acquire) }
     pub fn phrase(&self) -> String { self.phrase.read().unwrap().clone() }
     pub fn request_reload(&self){self.reload.store(true,std::sync::atomic::Ordering::Release);}
     pub fn take_reload(&self,data:&Path,store:&Store,training:bool)->Option<Box<dyn Wake>>{
         let changed = self.training.swap(training, std::sync::atomic::Ordering::Relaxed) != training;
         if !self.reload.swap(false,std::sync::atomic::Ordering::AcqRel) && !changed {return None;}
-        let loaded=load(data,store,training);*self.phrase.write().unwrap() = loaded.phrase; self.ready.store(loaded.ready,std::sync::atomic::Ordering::Release);self.last_prob.store(0,std::sync::atomic::Ordering::Relaxed);Some(loaded.det)
+        let loaded=load(data,store,training);
+        let default_phrase = loaded.phrase == crate::wake_profiles::DEFAULT_PHRASE;
+        *self.phrase.write().unwrap() = loaded.phrase;
+        self.default_phrase.store(default_phrase, std::sync::atomic::Ordering::Release);
+        self.ready.store(loaded.ready,std::sync::atomic::Ordering::Release);
+        self.last_prob.store(0,std::sync::atomic::Ordering::Relaxed);
+        Some(loaded.det)
     }
 }
